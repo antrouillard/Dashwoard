@@ -1,0 +1,173 @@
+@import url("https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 30% 8%;
+    --foreground: 45 40% 94%;
+    --card: 220 26% 12%;
+    --card-foreground: 45 40% 94%;
+    --popover: 220 26% 12%;
+    --popover-foreground: 45 40% 94%;
+    --primary: 42 70% 55%;
+    --primary-foreground: 220 30% 8%;
+    --secondary: 24 45% 35%;
+    --secondary-foreground: 45 40% 94%;
+    --muted: 220 16% 18%;
+    --muted-foreground: 220 10% 68%;
+    --accent: 42 70% 55%;
+    --accent-foreground: 220 30% 8%;
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 45 40% 94%;
+    --border: 220 18% 22%;
+    --input: 220 18% 22%;
+    --ring: 42 70% 55%;
+    --radius: 12px;
+    --chart-1: 38 75% 60%;
+    --chart-2: 197 48% 55%;
+    --chart-3: 266 45% 60%;
+    --chart-4: 14 70% 60%;
+    --chart-5: 160 55% 55%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    background-image: radial-gradient(circle at top left, rgba(241, 194, 106, 0.2), transparent 55%),
+      radial-gradient(circle at 20% 90%, rgba(73, 122, 205, 0.15), transparent 55%);
+    min-height: 100vh;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: "Cinzel", serif;
+  }
+  .dark {
+    --background: 220 30% 8%;
+    --foreground: 45 40% 94%;
+    --card: 220 26% 12%;
+    --card-foreground: 45 40% 94%;
+    --popover: 220 26% 12%;
+    --popover-foreground: 45 40% 94%;
+    --primary: 42 70% 55%;
+    --primary-foreground: 220 30% 8%;
+    --secondary: 24 45% 35%;
+    --secondary-foreground: 45 40% 94%;
+    --muted: 220 16% 18%;
+    --muted-foreground: 220 10% 68%;
+    --accent: 42 70% 55%;
+    --accent-foreground: 220 30% 8%;
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 45 40% 94%;
+    --border: 220 18% 22%;
+    --input: 220 18% 22%;
+    --ring: 42 70% 55%;
+    --chart-1: 38 75% 60%;
+    --chart-2: 197 48% 55%;
+    --chart-3: 266 45% 60%;
+    --chart-4: 14 70% 60%;
+    --chart-5: 160 55% 55%;
+  }
+}
+
+@layer components {
+  .dashboard-shell {
+    @apply min-h-screen px-4 pb-14;
+  }
+
+  .dashboard-grid {
+    @apply grid gap-4 md:grid-cols-12;
+  }
+
+  .panel-frame {
+    @apply rounded-xl border border-border bg-card/90 shadow-xl;
+  }
+
+  .panel-header {
+    @apply flex flex-wrap items-center justify-between gap-2 border-b border-border/70 px-4 py-3;
+  }
+
+  .panel-body {
+    @apply p-4;
+  }
+
+  .panel-compact .panel-header {
+    @apply px-3 py-2;
+  }
+
+  .panel-compact .panel-body {
+    @apply p-3;
+  }
+
+  .panel-compact .panel-title {
+    @apply text-xs tracking-[0.2em];
+  }
+
+  .panel-compact .panel-subtitle {
+    @apply text-[10px];
+  }
+
+  .panel-title {
+    @apply text-sm uppercase tracking-[0.2em] text-primary;
+  }
+
+  .panel-subtitle {
+    @apply text-xs text-muted-foreground;
+  }
+
+  .dense-table {
+    @apply w-full text-xs;
+  }
+
+  .dense-table th {
+    @apply px-3 py-2 text-left text-[0.6rem] uppercase tracking-[0.25em] text-primary;
+  }
+
+  .dense-table td {
+    @apply px-3 py-2 text-muted-foreground;
+  }
+
+  .dense-table tr {
+    @apply border-b border-border/60;
+  }
+
+  .dense-table tr:last-child {
+    @apply border-b-0;
+  }
+
+  .stat-pill {
+    @apply rounded-full bg-muted px-2 py-1 text-[0.65rem] uppercase tracking-[0.18em] text-foreground;
+  }
+
+  .rainbow-progress {
+    background-size: 200% 200%;
+    background-image: linear-gradient(
+      90deg,
+      #f97316,
+      #facc15,
+      #22c55e,
+      #3b82f6,
+      #a855f7,
+      #f97316
+    );
+    animation: rainbow-shift 3s linear infinite;
+  }
+}
+
+@keyframes rainbow-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 100% 50%;
+  }
+}
