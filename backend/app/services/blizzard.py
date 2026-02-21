@@ -15,7 +15,52 @@ from app.core.config import settings
 OAUTH_BASE = "https://oauth.battle.net"
 API_BASE = f"https://{settings.BLIZZARD_REGION}.api.blizzard.com"
 NAMESPACE = f"profile-{settings.BLIZZARD_REGION}"
+STATIC_NAMESPACE = f"static-{settings.BLIZZARD_REGION}"
 LOCALE = "fr_FR"
+
+# ── Mapping noms FR (tels que retournés par Blizzard) → profession ID ─────────
+# Ces IDs sont stables — ils ne changent pas entre extensions.
+PROFESSION_IDS: dict[str, int] = {
+    # Noms français (retournés par Blizzard avec locale=fr_FR)
+    "alchimie": 171,
+    "forge": 164,
+    "enchantement": 333,
+    "ingénierie": 202,
+    "joaillerie": 755,
+    "travail du cuir": 165,
+    "couture": 197,
+    "calligraphie": 773,
+    "cuisine": 185,
+    "pêche": 356,
+    "herboristerie": 182,
+    "mine": 186,
+    "dépeçage": 393,
+    "archéologie": 794,
+    # Noms anglais (fallback si le profil a été synchro avec locale=en_US)
+    "alchemy": 171,
+    "blacksmithing": 164,
+    "enchanting": 333,
+    "engineering": 202,
+    "jewelcrafting": 755,
+    "leatherworking": 165,
+    "tailoring": 197,
+    "inscription": 773,
+    "cooking": 185,
+    "fishing": 356,
+    "herbalism": 182,
+    "mining": 186,
+    "skinning": 393,
+    "archaeology": 794,
+}
+
+# ── Cache mémoire pour le token applicatif et les recettes ────────────────────
+_app_token_cache: dict = {"token": None, "expires_at": None}
+_recipe_list_cache: dict[str, tuple[list, datetime]] = {}   # {profession: ([recipes], cached_at)}
+_recipe_detail_cache: dict[int, dict] = {}                  # {recipe_id: detail}
+_RECIPE_CACHE_TTL = timedelta(hours=24)
+
+# Noms de pseudo-recettes (en-têtes de section Blizzard, ex: « Section I », « Appendice IV »)
+_FAKE_RECIPE_RE = re.compile(r'\b(Section|Appendice)\s+[IVXLCDM]+\b', re.IGNORECASE)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -221,3 +266,147 @@ def parse_professions(professions_data: dict | None) -> list[dict]:
                 )
                 break  # on ne prend que le tier courant (le plus récent)
     return results
+
+
+# ── API statique (client credentials — pas d'OAuth utilisateur) ──────────────
+
+
+async def get_app_token() -> str:
+    """
+    Retourne un token Blizzard via client credentials.
+    Utilisé pour l'API statique (recettes, items...) sans connexion utilisateur.
+    Mis en cache mémoire jusqu'à expiration.
+    """
+    now = datetime.utcnow()
+    if _app_token_cache["token"] and _app_token_cache["expires_at"] and _app_token_cache["expires_at"] > now:
+        return _app_token_cache["token"]
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{OAUTH_BASE}/token",
+            auth=(settings.BLIZZARD_CLIENT_ID, settings.BLIZZARD_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    _app_token_cache["token"] = data["access_token"]
+    # On retire 60s de marge pour éviter les expiration race conditions
+    _app_token_cache["expires_at"] = now + timedelta(seconds=data.get("expires_in", 86400) - 60)
+    return _app_token_cache["token"]
+
+
+async def _get_static(path: str, extra_params: dict | None = None) -> dict | None:
+    """GET authentifié sur l'API statique Blizzard (namespace=static-eu)."""
+    token = await get_app_token()
+    params = {"namespace": STATIC_NAMESPACE, "locale": LOCALE}
+    if extra_params:
+        params.update(extra_params)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{API_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def get_profession_recipes(profession_name: str) -> list[dict]:
+    """
+    Retourne la liste des recettes de la dernière extension pour une profession.
+    Format : [{recipe_id, name, category}]
+    Résultat mis en cache mémoire 24h (les recettes ne changent qu'à chaque patch).
+
+    On prend automatiquement le tier avec le plus grand id = extension la plus récente.
+    """
+    key = profession_name.lower().strip()
+
+    # Cache hit
+    if key in _recipe_list_cache:
+        recipes, cached_at = _recipe_list_cache[key]
+        if datetime.utcnow() - cached_at < _RECIPE_CACHE_TTL:
+            return recipes
+
+    profession_id = PROFESSION_IDS.get(key)
+    if not profession_id:
+        return []
+
+    # Récupère les tiers de la profession
+    prof_data = await _get_static(f"/data/wow/profession/{profession_id}")
+    if not prof_data:
+        return []
+
+    skill_tiers = prof_data.get("skill_tiers", [])
+    if not skill_tiers:
+        return []
+
+    # Tier le plus récent = plus grand id (TWW > DF > SL ...)
+    latest_tier = max(skill_tiers, key=lambda t: t["id"])
+
+    tier_data = await _get_static(
+        f"/data/wow/profession/{profession_id}/skill-tier/{latest_tier['id']}"
+    )
+    if not tier_data:
+        return []
+
+    recipes: list[dict] = []
+    for category in tier_data.get("categories", []):
+        cat_name = category.get("name", "")
+        for recipe in category.get("recipes", []):
+            name = recipe["name"]
+            if _FAKE_RECIPE_RE.search(name):
+                continue  # pseudo-recette (en-tête de section Blizzard)
+            recipes.append({
+                "recipe_id": recipe["id"],
+                "name": name,
+                "category": cat_name,
+            })
+
+    recipes.sort(key=lambda r: r["name"])
+    _recipe_list_cache[key] = (recipes, datetime.utcnow())
+    return recipes
+
+
+async def get_recipe_detail(recipe_id: int) -> dict | None:
+    """
+    Retourne les détails d'une recette : item crafté (id + nom) + réactifs.
+    Mis en cache mémoire indéfiniment (les recettes ne changent pas en cours de patch).
+
+    Note : certaines recettes craftent plusieurs items ou des items conditionnels
+    (Alliance vs Horde) — on prend le premier disponible.
+    """
+    if recipe_id in _recipe_detail_cache:
+        return _recipe_detail_cache[recipe_id]
+
+    data = await _get_static(f"/data/wow/recipe/{recipe_id}")
+    if not data:
+        # Blizzard static API indisponible (pas de credentials) — on renvoie None,
+        # la route crafting utilisera Wowhead search comme fallback.
+        return None
+
+    # L'item crafté peut être dans "crafted_item" ou "alliance_crafted_item" etc.
+    crafted = (
+        data.get("crafted_item")
+        or data.get("alliance_crafted_item")
+        or data.get("horde_crafted_item")
+    )
+
+    result: dict = {
+        "recipe_id": recipe_id,
+        "recipe_name": data.get("name"),
+        "item_id": None,
+        "item_name": None,
+        "reagents": [],
+    }
+
+    if crafted:
+        result["item_id"] = crafted.get("item", {}).get("id")
+        result["item_name"] = crafted.get("item", {}).get("name") or data.get("name")
+
+    # Les réactifs sont récupérés via Wowhead (scrape) dans la route — pas ici.
+    _recipe_detail_cache[recipe_id] = result
+    return result

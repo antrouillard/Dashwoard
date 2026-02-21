@@ -8,7 +8,7 @@ from app.db import create_tables
 # Importer tous les modèles avant create_tables() pour que SQLAlchemy
 # résolve correctement toutes les relations (forward references).
 import app.models  # noqa: F401
-from app.api.routes import accounts, characters, todos, guilds, auth, sync, weekly
+from app.api.routes import accounts, characters, todos, guilds, auth, sync, weekly, crafting
 
 
 @asynccontextmanager
@@ -45,6 +45,7 @@ app.include_router(auth.router)
 # Sync — sous /api comme les autres routes
 app.include_router(sync.router, prefix="/api")
 app.include_router(weekly.router, prefix="/api")
+app.include_router(crafting.router, prefix="/api")
 
 
 @app.get("/health", tags=["health"])

@@ -176,3 +176,100 @@ export function useCreateWeekly(onSuccess) {
     error,
   };
 }
+
+// ── Crafting — commandes ──────────────────────────────────────────────────────
+
+export function useCraftingOrders(filters = {}) {
+  return useQuery(() => api.crafting.orders.list(filters), [
+    filters.character_id,
+    filters.profession,
+    filters.status,
+  ]);
+}
+
+export function useCreateCraftingOrder(onSuccess) {
+  const { mutate, loading, error } = useMutation((data) => api.crafting.orders.create(data));
+  return {
+    createOrder: async (data) => {
+      const result = await mutate(data);
+      onSuccess?.(result);
+      return result;
+    },
+    loading,
+    error,
+  };
+}
+
+export function useAdvanceCraftingOrder(onSuccess) {
+  const { mutate, loading, error } = useMutation((id) => api.crafting.orders.advance(id));
+  return {
+    advanceOrder: async (id) => {
+      const result = await mutate(id);
+      onSuccess?.(result);
+      return result;
+    },
+    loading,
+    error,
+  };
+}
+
+export function useDeleteCraftingOrder(onSuccess) {
+  const { mutate, loading, error } = useMutation((id) => api.crafting.orders.delete(id));
+  return {
+    deleteOrder: async (id) => {
+      await mutate(id);
+      onSuccess?.();
+    },
+    loading,
+    error,
+  };
+}
+
+// ── Crafting — objectifs ──────────────────────────────────────────────────────
+
+export function useCraftingGoals(filters = {}) {
+  return useQuery(() => api.crafting.goals.list(filters), [
+    filters.character_id,
+    filters.profession,
+  ]);
+}
+
+export function useCreateCraftingGoal(onSuccess) {
+  const { mutate, loading, error } = useMutation((data) => api.crafting.goals.create(data));
+  return {
+    createGoal: async (data) => {
+      const result = await mutate(data);
+      onSuccess?.(result);
+      return result;
+    },
+    loading,
+    error,
+  };
+}
+
+export function useUpdateCraftingGoal(onSuccess) {
+  const { mutate, loading, error } = useMutation(({ id, data }) =>
+    api.crafting.goals.update(id, data)
+  );
+  return {
+    updateGoal: async (id, data) => {
+      const result = await mutate({ id, data });
+      onSuccess?.(result);
+      return result;
+    },
+    loading,
+    error,
+  };
+}
+
+export function useDeleteCraftingGoal(onSuccess) {
+  const { mutate, loading, error } = useMutation((id) => api.crafting.goals.delete(id));
+  return {
+    deleteGoal: async (id) => {
+      await mutate(id);
+      onSuccess?.();
+    },
+    loading,
+    error,
+  };
+}

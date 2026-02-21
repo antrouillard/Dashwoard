@@ -86,6 +86,64 @@ export const api = {
     delete: (id) => request(`/weekly/${id}`, { method: "DELETE" }),
   },
 
+  // ── Crafting ───────────────────────────────────────────────────────────────
+  crafting: {
+    orders: {
+      list: (filters = {}) => {
+        const params = new URLSearchParams();
+        if (filters.character_id) params.set("character_id", filters.character_id);
+        if (filters.profession) params.set("profession", filters.profession);
+        if (filters.status) params.set("status", filters.status);
+        const qs = params.toString();
+        return request(`/crafting/orders${qs ? `?${qs}` : ""}`);
+      },
+      get: (id) => request(`/crafting/orders/${id}`),
+      create: (data) => request("/crafting/orders", { method: "POST", body: JSON.stringify(data) }),
+      update: (id, data) => request(`/crafting/orders/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+      advance: (id) => request(`/crafting/orders/${id}/advance`, { method: "PATCH" }),
+      delete: (id) => request(`/crafting/orders/${id}`, { method: "DELETE" }),
+    },
+    goals: {
+      list: (filters = {}) => {
+        const params = new URLSearchParams();
+        if (filters.character_id) params.set("character_id", filters.character_id);
+        if (filters.profession) params.set("profession", filters.profession);
+        const qs = params.toString();
+        return request(`/crafting/goals${qs ? `?${qs}` : ""}`);
+      },
+      get: (id) => request(`/crafting/goals/${id}`),
+      create: (data) => request("/crafting/goals", { method: "POST", body: JSON.stringify(data) }),
+      update: (id, data) => request(`/crafting/goals/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+      delete: (id) => request(`/crafting/goals/${id}`, { method: "DELETE" }),
+      // Quantités posssédées par réactif (persistance DB)
+      reagents: () => request("/crafting/goals/reagents"),
+      saveReagent: (goalId, itemId, haveQty) =>
+        request(`/crafting/goals/${goalId}/reagents/${itemId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ have_qty: haveQty }),
+        }),
+    },
+    recipes: {
+      listByProfession: (professionName) =>
+        request(`/crafting/professions/${encodeURIComponent(professionName.toLowerCase())}/recipes`),
+      // item_name optionnel : permet le fallback Wowhead côté backend si Blizzard static indispo
+      getDetail: (recipeId, itemName) => {
+        const qs = itemName ? `?item_name=${encodeURIComponent(itemName)}` : "";
+        return request(`/crafting/recipes/${recipeId}${qs}`);
+      },
+      // Charge tout le cache DB en une seule requête (montée du composant)
+      loadCache: () => request("/crafting/recipes/cache"),
+      // Recherche Wowhead directe (publique, sans credentials Blizzard)
+      searchItem: (name) => request(`/crafting/search-item?q=${encodeURIComponent(name)}`),
+    },
+    backfillItemIds: () => request("/crafting/backfill-item-ids", { method: "POST" }),
+    admin: {
+      truncate: () => request("/crafting/admin/truncate", { method: "DELETE" }),
+      clearRecipeCache: () => request("/crafting/admin/clear-recipe-cache", { method: "POST" }),
+      debugRecipeRaw: (recipeId) => request(`/crafting/debug/recipe-raw/${recipeId}`),
+    },
+  },
+
   // ── Auth Blizzard ──────────────────────────────────────────────────────────
   // loginUrl déclenche une navigation navigateur, pas un fetch
   auth: {
