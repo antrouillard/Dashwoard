@@ -127,6 +127,11 @@ function App() {
               Todos
             </NavLink>
           </Button>
+          <Button asChild>
+            <NavLink to="/activites" className={navLinkClass}>
+              Activites
+            </NavLink>
+          </Button>
         </nav>
         <div className="flex flex-wrap items-center gap-3">
           <DropdownMenu>

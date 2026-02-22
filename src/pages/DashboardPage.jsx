@@ -1,9 +1,16 @@
-﻿import { useMemo, useCallback } from "react";
+﻿import { useMemo, useCallback, useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { Badge } from "@/components/ui/warcraftcn/badge";
 import { Button } from "@/components/ui/warcraftcn/button";
 import { Skeleton } from "@/components/ui/warcraftcn/skeleton";
 import { mockData } from "@/data/mockData";
+import { getCurrentWeek } from "@/data/activities";
+
+const STORAGE_KEY = "wow-activities-done";
+function loadActivityDone() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}"); }
+  catch { return {}; }
+}
 import {
   useDefaultAccount,
   useCharacters,
@@ -65,10 +72,28 @@ function DashboardPage() {
 
   const { advanceTodo } = useAdvanceTodo(refetchTodos);
 
-  // Fallback mockData pour les sections pas encore en API (market, heroStats, weekly)
-  const weekly = mockData.weekly;
+  // Fallback mockData pour les sections pas encore en API (market, heroStats)
   const market = mockData.market;
   const heroStats = mockData.heroStats;
+
+  // Activities : semaine courante depuis le calendrier
+  const currentWeek = useMemo(() => getCurrentWeek(new Date()), []);
+  const [actDone, setActDone] = useState(() => loadActivityDone());
+  // Sync avec localStorage (partagé avec ActivitiesPage)
+  useEffect(() => {
+    const onStorage = () => setActDone(loadActivityDone());
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+  const priorityTasks = useMemo(
+    () => (currentWeek?.tasks ?? []).filter((t) => t.important).slice(0, 5),
+    [currentWeek]
+  );
+  const weekDoneCount = useMemo(
+    () => (currentWeek?.tasks ?? []).filter((t) => actDone[t.id]).length,
+    [currentWeek, actDone]
+  );
+  const weekTotal = currentWeek?.tasks?.length ?? 0;
 
   // Guilde principale (premiÃ¨re de la liste)
   const guild = guilds?.[0] ?? null;
@@ -110,47 +135,94 @@ function DashboardPage() {
   return (
     <div className="dashboard-grid">
       {/* â”€â”€ ActivitÃ©s hebdo â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {/* ── Activités (calendrier) ──────────────────────────────────────── */}
       <Panel
-        title="Activites disponibles"
-        subtitle="Priorites et lockouts"
+        title="Activites"
+        subtitle={currentWeek ? currentWeek.subtitle : "Avant le lancement"}
         className="md:col-span-3"
-        actions={<Badge size="sm">{weekly.length} focus</Badge>}
+        actions={
+          <div className="flex items-center gap-2">
+            <Badge size="sm">{weekDoneCount}/{weekTotal}</Badge>
+            <button
+              onClick={() => navigate("/activites")}
+              className="text-[10px] text-muted-foreground hover:text-primary transition-colors"
+            >
+              Tout voir →
+            </button>
+          </div>
+        }
       >
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th>Focus</th>
-              <th>Detail</th>
-              <th>Etat</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {weekly.map((item) => {
-              const badgeProps = statusToBadge(item.status);
-              return (
-                <tr key={item.title}>
-                  <td className="text-foreground">{item.title}</td>
-                  <td>{item.detail}</td>
-                  <td>
-                    <Badge size="sm" {...badgeProps}>
-                      {item.status}
-                    </Badge>
-                  </td>
-                  <td>
-                    <button
-                      onClick={() => navigate(`/todos?title=${encodeURIComponent(item.title)}`)}
-                      className="text-[10px] text-muted-foreground hover:text-primary transition-colors"
-                      title="Ajouter en todo"
-                    >
-                      → Todo
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        {/* Mini progress bar */}
+        <div className="mb-3">
+          <div className="h-1 w-full rounded-full bg-muted/60 overflow-hidden">
+            <div
+              className={`h-1 rounded-full transition-all duration-500 ${
+                weekTotal > 0 && weekDoneCount === weekTotal
+                  ? "bg-emerald-500"
+                  : "bg-primary"
+              }`}
+              style={{ width: weekTotal > 0 ? `${Math.round((weekDoneCount / weekTotal) * 100)}%` : "0%" }}
+            />
+          </div>
+        </div>
+
+        {/* Crest warning */}
+        {currentWeek?.note && (
+          <div className="mb-3 flex items-start gap-1.5 rounded border border-amber-500/30 bg-amber-500/8 px-2 py-1.5">
+            <span className="shrink-0 text-amber-400 text-xs">⚠</span>
+            <p className="text-[10px] text-amber-200 leading-snug">{currentWeek.note}</p>
+          </div>
+        )}
+
+        {!currentWeek && (
+          <p className="text-xs text-muted-foreground">
+            Le programme commence le 26 févr. 2026 (Early Access).
+          </p>
+        )}
+
+        {/* Priorité-only tasks */}
+        <div className="flex flex-col gap-1.5">
+          {priorityTasks.map((task) => {
+            const done = !!actDone[task.id];
+            return (
+              <div
+                key={task.id}
+                className={`flex items-start gap-2 rounded border px-2 py-1.5 ${
+                  done
+                    ? "border-emerald-500/20 bg-emerald-500/5 opacity-60"
+                    : "border-primary/20 bg-primary/5"
+                }`}
+              >
+                <span
+                  className={`mt-0.5 flex h-3 w-3 shrink-0 items-center justify-center rounded border ${
+                    done ? "border-emerald-500 bg-emerald-500" : "border-primary/50"
+                  }`}
+                >
+                  {done && (
+                    <svg className="h-2 w-2 text-black" viewBox="0 0 10 10" fill="none">
+                      <path d="M1.5 5L4 7.5 8.5 2.5" stroke="currentColor" strokeWidth="1.5"
+                        strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  )}
+                </span>
+                <p className={`text-[11px] leading-snug ${
+                  done ? "line-through text-muted-foreground" : "text-foreground/90"
+                }`}>
+                  {task.label}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+
+        {currentWeek && priorityTasks.length < weekTotal && (
+          <button
+            onClick={() => navigate("/activites")}
+            className="mt-2 block w-full text-center text-[10px] text-muted-foreground hover:text-primary transition-colors"
+          >
+            +{weekTotal - priorityTasks.length} autres tâches →
+          </button>
+        )}
       </Panel>
 
       {/* â”€â”€ Personnages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}

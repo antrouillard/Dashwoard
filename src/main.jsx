@@ -8,6 +8,7 @@ import DashboardPage from "./pages/DashboardPage.jsx";
 import PersonnagesPage from "./pages/PersonnagesPage.jsx";
 import TodosPage from "./pages/TodosPage.jsx";
 import PlaceholderPage from "./pages/PlaceholderPage.jsx";
+import ActivitiesPage from "./pages/ActivitiesPage.jsx";
 
 createRoot(document.getElementById("root")).render(
   <StrictMode>
@@ -20,6 +21,7 @@ createRoot(document.getElementById("root")).render(
           <Route path="guilde" element={<PlaceholderPage title="Guilde" />} />
           <Route path="economie" element={<PlaceholderPage title="Economie" />} />
           <Route path="todos" element={<TodosPage />} />
+          <Route path="activites" element={<ActivitiesPage />} />
         </Route>
       </Routes>
     </BrowserRouter>
