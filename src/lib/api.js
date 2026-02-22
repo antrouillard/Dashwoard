@@ -136,6 +136,14 @@ export const api = {
       // Recherche Wowhead directe (publique, sans credentials Blizzard)
       searchItem: (name) => request(`/crafting/search-item?q=${encodeURIComponent(name)}`),
     },
+    profitability: (profession) =>
+      request(`/crafting/profitability?profession=${encodeURIComponent(profession)}`),
+    analyzeProfitability: (profession, numTiers = 1) =>
+      request(`/crafting/profitability/analyze?profession=${encodeURIComponent(profession)}&num_tiers=${numTiers}`, { method: "POST" }),
+    ahPricesStatus: () => request("/crafting/ah-prices/status"),
+    ahPricesForItems: (ids) => request(`/crafting/ah-prices/items?ids=${ids.join(",")}`),
+    syncAHPrices: () => request("/crafting/ah-prices/sync", { method: "POST" }),
+    debugAHPrice: (itemId) => request(`/crafting/debug/ah-price/${itemId}`),
     backfillItemIds: () => request("/crafting/backfill-item-ids", { method: "POST" }),
     admin: {
       truncate: () => request("/crafting/admin/truncate", { method: "DELETE" }),

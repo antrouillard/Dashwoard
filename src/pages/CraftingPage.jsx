@@ -50,6 +50,18 @@ function formatGold(gold) {
   return `+${gold} or`;
 }
 
+/** Formate un montant en copper → "+123k or", "+45 or", "+12a" */
+function formatCopper(copper) {
+  if (!copper && copper !== 0) return "—";
+  const sign = copper < 0 ? "-" : "+";
+  const abs  = Math.abs(copper);
+  const g    = abs / 10000;
+  if (g >= 1000) return `${sign}${(g / 1000).toFixed(1)}k or`;
+  if (g >= 1)    return `${sign}${Math.round(g)} or`;
+  const s = Math.floor((abs / 100) % 100);
+  return `${sign}${s}a`;
+}
+
 const EMPTY_ORDER = { item_name: "", item_id: null, recipe_id: null, client: "", character_id: "", profession: "", profit_gold: 0 };
 const EMPTY_GOAL  = { title: "", item_id: null, recipe_id: null, character_id: "", profession: "" };
 
@@ -87,6 +99,65 @@ function CraftingPage() {
   const reagentTimers    = useRef({});
   const loadingRecipeIds = useRef(new Set()); // évite les doublons de chargement
   const cacheInitialized = useRef(false);     // garantit un seul chargement du cache DB
+
+  // ── Analyse de rentabilité (Hôtel des Ventes) ─────────────────────────────
+  const [profitProfession, setProfitProfession] = useState("");
+  const [numTiers,         setNumTiers]         = useState(1);    // 1=TWW, 2=+DF, 0=tous
+  const [profitLoading,    setProfitLoading]    = useState(false);
+  const [profitRows,       setProfitRows]       = useState(null);
+  const [profitMeta,       setProfitMeta]       = useState(null);
+  const [profitError,      setProfitError]      = useState(null);
+  const [profitExpanded,   setProfitExpanded]   = useState(new Set());
+  const [profitSort,       setProfitSort]       = useState({ key: "profit_copper", dir: "desc" });
+  const [profitFilterCats, setProfitFilterCats] = useState(new Set()); // catégories actives (vide = tout)
+  const [profitFilterTiers,setProfitFilterTiers]= useState(new Set()); // tiers actifs (vide = tout)
+  const [ahStatus,         setAhStatus]         = useState(null); // {items_count, last_sync_at}
+  const [ahSyncing,        setAhSyncing]        = useState(false);
+  const [ahSyncMsg,        setAhSyncMsg]        = useState(null);
+  const [ahItemPrices,     setAhItemPrices]     = useState({});   // {item_id: copper}
+
+  // Tri + filtrage de la table de rentabilité
+  const availableCats  = useMemo(
+    () => [...new Set((profitRows ?? []).map((r) => r.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, "fr")),
+    [profitRows]
+  );
+  const availableTiers = useMemo(
+    () => [...new Set((profitRows ?? []).map((r) => r.tier_name).filter(Boolean))].sort((a, b) => a.localeCompare(b, "fr")),
+    [profitRows]
+  );
+
+  const sortedProfitRows = useMemo(() => {
+    if (!profitRows) return [];
+    const { key, dir } = profitSort;
+    const filtered = profitRows.filter(
+      (r) =>
+        (profitFilterCats.size  === 0 || profitFilterCats.has(r.category))  &&
+        (profitFilterTiers.size === 0 || profitFilterTiers.has(r.tier_name))
+    );
+    return filtered.sort((a, b) => {
+      const av = a[key] ?? (typeof a[key] === "number" ? 0 : "");
+      const bv = b[key] ?? (typeof b[key] === "number" ? 0 : "");
+      const cmp = typeof av === "string" ? av.localeCompare(bv, "fr") : av - bv;
+      return dir === "asc" ? cmp : -cmp;
+    });
+  }, [profitRows, profitSort, profitFilterCats, profitFilterTiers]);
+
+  const toggleFilterCat  = (v) => setProfitFilterCats( (prev) => { const s = new Set(prev); s.has(v) ? s.delete(v) : s.add(v); return s; });
+  const toggleFilterTier = (v) => setProfitFilterTiers((prev) => { const s = new Set(prev); s.has(v) ? s.delete(v) : s.add(v); return s; });
+
+  const toggleSort = (key) => {
+    setProfitSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: typeof (profitRows?.[0]?.[key]) === "string" ? "asc" : "desc" }
+    );
+  };
+
+  // Statut des prix AH au montage
+  useEffect(() => {
+    api.crafting.ahPricesStatus().then(setAhStatus).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Sélecteurs dérivés ────────────────────────────────────────────────────
 
@@ -280,10 +351,6 @@ function CraftingPage() {
     return mockData.characters.filter((c) => selectedKeys.includes(c.name)).flatMap((c) => c.professions);
   }, [selectedKeys, viewMode, byProfession]);
 
-  const filteredBestCrafts = useMemo(
-    () => mockData.crafting.bestCrafts.filter((c) => activeMockProfs.includes(c.profession)),
-    [activeMockProfs]
-  );
   const filteredSkillTree  = useMemo(
     () => mockData.crafting.skillTree.filter((n) => activeMockProfs.includes(n.profession)),
     [activeMockProfs]
@@ -304,6 +371,34 @@ function CraftingPage() {
 
   const materialsOrders = useMemo(() => buildMaterialsMap(filteredOrders), [filteredOrders, buildMaterialsMap]);
   const materialsGoals  = useMemo(() => buildMaterialsMap(filteredGoals),  [filteredGoals,  buildMaterialsMap]);
+
+  // Prix AH des items des commandes / objectifs / matériaux
+  // (placé ici, après filteredOrders/goals/materials qui sont utilisés dans les dépendances)
+  useEffect(() => {
+    const ids = new Set();
+    [...filteredOrders, ...filteredGoals].forEach((x) => {
+      if (x.item_id) ids.add(x.item_id);
+      if (x.recipe_id && recipeDetails[x.recipe_id]) {
+        recipeDetails[x.recipe_id].reagents.forEach((r) => { if (r.item_id) ids.add(r.item_id); });
+      }
+    });
+    [...materialsOrders, ...materialsGoals].forEach((m) => { if (m.item_id) ids.add(m.item_id); });
+    if (ids.size === 0) return;
+    api.crafting.ahPricesForItems([...ids]).then(setAhItemPrices).catch(() => {});
+  }, [filteredOrders, filteredGoals, materialsOrders, materialsGoals, recipeDetails]);
+
+  /** Calcule le coût de fabrication d'une recette depuis le cache local. */
+  const craftCostInfo = useCallback((recipeId) => {
+    if (!recipeId || !recipeDetails[recipeId]) return null;
+    const { reagents } = recipeDetails[recipeId];
+    let total = 0, partial = false;
+    for (const r of reagents) {
+      const p = ahItemPrices[r.item_id];
+      if (p) total += p * r.quantity;
+      else if (r.item_id) partial = true;
+    }
+    return { total, partial };
+  }, [recipeDetails, ahItemPrices]);
 
   // Professions disponibles dans les forms (selon le perso choisi)
   const orderFormProfs = useMemo(() => {
@@ -355,6 +450,74 @@ function CraftingPage() {
     setNewGoal(EMPTY_GOAL);
     setShowGoalForm(false);
   }, [newGoal, createGoal]);
+
+  // ── Analyse de rentabilité ────────────────────────────────────────────────────
+  const handleSyncAHPrices = async () => {
+    setAhSyncing(true);
+    setAhSyncMsg(null);
+    try {
+      const res = await api.crafting.syncAHPrices();
+      const realmLabel = res.realm ? ` · ${res.realm} (${res.realm_items?.toLocaleString()} items)` : "";
+      setAhSyncMsg(`✓ ${res.items_upserted?.toLocaleString()} items — commodités EU : ${res.commodity_items?.toLocaleString()}${realmLabel}`);
+      api.crafting.ahPricesStatus().then(setAhStatus).catch(() => {});
+    } catch (err) {
+      setAhSyncMsg(`✗ ${err.message ?? "Erreur sync"}`);
+    } finally {
+      setAhSyncing(false);
+    }
+  };
+
+  // Charge les résultats mis en cache en base, puis affiche
+  const handleLoadCached = async (profession) => {
+    if (!profession) return;
+    setProfitLoading(true);
+    setProfitError(null);
+    try {
+      const data = await api.crafting.profitability(profession);
+      if (data.rows?.length > 0) {
+        setProfitRows(data.rows);
+        setProfitMeta(data.meta);
+        setTimeout(() => window.WH?.Tooltips?.refreshLinks?.(), 200);
+      } else {
+        setProfitRows([]);
+        setProfitMeta(data.meta);
+      }
+    } catch (err) {
+      setProfitError(err.message ?? "Erreur chargement");
+    } finally {
+      setProfitLoading(false);
+    }
+  };
+
+  // Lance le calcul (POST analyze) puis charge les résultats (GET profitability)
+  const handleAnalyze = async () => {
+    if (!profitProfession) return;
+    setProfitLoading(true);
+    setProfitError(null);
+    setProfitRows(null);
+    setProfitMeta(null);
+    setProfitFilterCats(new Set());
+    setProfitFilterTiers(new Set());
+    try {
+      const summary = await api.crafting.analyzeProfitability(profitProfession, numTiers);
+      const data    = await api.crafting.profitability(profitProfession);
+      setProfitRows(data.rows ?? []);
+      setProfitMeta({ ...data.meta, ...summary });
+      setTimeout(() => window.WH?.Tooltips?.refreshLinks?.(), 200);
+    } catch (err) {
+      setProfitError(err.message ?? "Erreur inconnue");
+    } finally {
+      setProfitLoading(false);
+    }
+  };
+
+  const toggleProfitExpand = (id) => {
+    setProfitExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
 
   // ── Styles communs ────────────────────────────────────────────────────────
   const inputClass  = "w-full rounded-md border border-border/60 bg-background/60 px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/60";
@@ -494,42 +657,57 @@ function CraftingPage() {
           <p className="text-xs text-muted-foreground italic py-2">Aucune commande pour cette sélection.</p>
         ) : (
           <table className="dense-table">
-            <thead><tr><th>Client</th><th>Objet</th><th>Perso</th><th>Statut</th><th>Marge</th><th></th></tr></thead>
+            <thead><tr><th>Client</th><th>Objet</th><th>Perso</th><th>Statut</th><th className="text-right">Coût</th><th className="text-right">Prix AH</th><th>Marge</th><th></th></tr></thead>
             <tbody>
-              {filteredOrders.map((order) => (
-                <tr key={order.id}>
-                  <td className="text-foreground">{order.client}</td>
-                  <td>
-                    {order.item_id ? (
-                      <a
-                        href={`https://www.wowhead.com/fr/item=${order.item_id}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-[13px]"
-                      >
-                        {order.item_name}
-                      </a>
-                    ) : (
-                      order.item_name
-                    )}
-                  </td>
-                  <td className="text-muted-foreground">{order.character?.name ?? "—"}</td>
-                  <td>
-                    <button type="button" title="Cliquer pour avancer le statut" onClick={() => advanceOrder(order.id)}>
-                      <Badge size="sm" variant={STATUS_VARIANT[order.status] ?? "outline"}>
-                        {STATUS_LABEL[order.status] ?? order.status}
-                      </Badge>
-                    </button>
-                  </td>
-                  <td className="text-primary">{formatGold(order.profit_gold)}</td>
-                  <td>
-                    <button type="button" onClick={() => deleteOrder(order.id)}
-                      className="text-muted-foreground hover:text-destructive text-xs transition-colors" title="Supprimer">
-                      ✕
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {filteredOrders.map((order) => {
+                const cost = craftCostInfo(order.recipe_id);
+                const ahSell = ahItemPrices[order.item_id] ?? 0;
+                return (
+                  <tr key={order.id}>
+                    <td className="text-foreground">{order.client}</td>
+                    <td>
+                      {order.item_id ? (
+                        <a
+                          href={`https://www.wowhead.com/fr/item=${order.item_id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[13px]"
+                        >
+                          {order.item_name}
+                        </a>
+                      ) : (
+                        order.item_name
+                      )}
+                    </td>
+                    <td className="text-muted-foreground">{order.character?.name ?? "—"}</td>
+                    <td>
+                      <button type="button" title="Cliquer pour avancer le statut" onClick={() => advanceOrder(order.id)}>
+                        <Badge size="sm" variant={STATUS_VARIANT[order.status] ?? "outline"}>
+                          {STATUS_LABEL[order.status] ?? order.status}
+                        </Badge>
+                      </button>
+                    </td>
+                    <td className="text-right text-[11px] text-muted-foreground">
+                      {cost
+                        ? <span title={cost.partial ? "Coût partiel — réactifs manquants" : undefined}>
+                            {cost.partial && <span className="mr-0.5 opacity-60">~</span>}
+                            {formatCopper(cost.total)}
+                          </span>
+                        : <span className="opacity-40">—</span>}
+                    </td>
+                    <td className="text-right text-[11px]">
+                      {ahSell ? formatCopper(ahSell) : <span className="opacity-40">—</span>}
+                    </td>
+                    <td className="text-primary">{formatGold(order.profit_gold)}</td>
+                    <td>
+                      <button type="button" onClick={() => deleteOrder(order.id)}
+                        className="text-muted-foreground hover:text-destructive text-xs transition-colors" title="Supprimer">
+                        ✕
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -616,6 +794,30 @@ function CraftingPage() {
                           {goal.character.name} · {goal.profession}
                         </p>
                       )}
+                    {/* Récapitulatif des prix */}
+                    {(() => {
+                      const cost = craftCostInfo(goal.recipe_id);
+                      const ahSell = ahItemPrices[goal.item_id] ?? 0;
+                      if (!cost && !ahSell) return null;
+                      const profit = ahSell > 0 && cost?.total > 0 ? Math.round(ahSell * 0.95) - cost.total : null;
+                      return (
+                        <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1 text-[10px]">
+                          {cost && (
+                            <span className="text-muted-foreground" title={cost.partial ? "Coût partiel" : "Coût de fabrication"}>
+                              Coût : {cost.partial && <span className="mr-0.5">~</span>}{formatCopper(cost.total)}
+                            </span>
+                          )}
+                          {ahSell > 0 && (
+                            <span className="text-muted-foreground">AH : {formatCopper(ahSell)}</span>
+                          )}
+                          {profit !== null && (
+                            <span className={profit >= 0 ? "text-green-500" : "text-destructive"}>
+                              Profit : {formatCopper(profit)}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })()}
                     </div>
                     <button type="button" onClick={() => deleteGoal(goal.id)}
                       className="ml-1 text-muted-foreground hover:text-destructive text-xs transition-colors shrink-0" title="Supprimer">✕</button>
@@ -731,17 +933,23 @@ function CraftingPage() {
         ) : (
           <table className="dense-table mb-2">
             <tbody>
-              {materialsOrders.map((mat) => (
-                <tr key={mat.item_id}>
-                  <td>
-                    <a href={`https://www.wowhead.com/fr/item=${mat.item_id}`}
-                      target="_blank" rel="noopener noreferrer" className="text-[13px]">
-                      {mat.item_name}
-                    </a>
-                  </td>
-                  <td className="text-right text-primary font-medium">{mat.qty}</td>
-                </tr>
-              ))}
+              {materialsOrders.map((mat) => {
+                const unit = ahItemPrices[mat.item_id] ?? 0;
+                const total = unit * mat.qty;
+                return (
+                  <tr key={mat.item_id}>
+                    <td>
+                      <a href={`https://www.wowhead.com/fr/item=${mat.item_id}`}
+                        target="_blank" rel="noopener noreferrer" className="text-[13px]">
+                        {mat.item_name}
+                      </a>
+                    </td>
+                    <td className="text-right text-primary font-medium">{mat.qty}</td>
+                    <td className="text-right text-[10px] text-muted-foreground">{unit ? formatCopper(unit) : <span className="opacity-40">—</span>}</td>
+                    <td className="text-right text-[10px]">{total ? formatCopper(total) : <span className="opacity-40">—</span>}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -757,43 +965,349 @@ function CraftingPage() {
         ) : (
           <table className="dense-table">
             <tbody>
-              {materialsGoals.map((mat) => (
-                <tr key={mat.item_id}>
-                  <td>
-                    <a href={`https://www.wowhead.com/fr/item=${mat.item_id}`}
-                      target="_blank" rel="noopener noreferrer" className="text-[13px]">
-                      {mat.item_name}
-                    </a>
-                  </td>
-                  <td className="text-right text-primary font-medium">{mat.qty}</td>
-                </tr>
-              ))}
+              {materialsGoals.map((mat) => {
+                const unit = ahItemPrices[mat.item_id] ?? 0;
+                const total = unit * mat.qty;
+                return (
+                  <tr key={mat.item_id}>
+                    <td>
+                      <a href={`https://www.wowhead.com/fr/item=${mat.item_id}`}
+                        target="_blank" rel="noopener noreferrer" className="text-[13px]">
+                        {mat.item_name}
+                      </a>
+                    </td>
+                    <td className="text-right text-primary font-medium">{mat.qty}</td>
+                    <td className="text-right text-[10px] text-muted-foreground">{unit ? formatCopper(unit) : <span className="opacity-40">—</span>}</td>
+                    <td className="text-right text-[10px]">{total ? formatCopper(total) : <span className="opacity-40">—</span>}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
         </div>
       </Panel>
 
-      {/* ── Crafts rentables (MOCK — nécessite données AH niveau 2) ─────── */}
-      <Panel title="Crafts rentables" subtitle="Top marges — données AH a venir" className="md:col-span-12"
-        actions={<Badge size="sm">Mock</Badge>}
+      {/* ── Analyse de rentabilité (Hôtel des Ventes Commodités EU) ─────────────── */}
+      <Panel
+        title="Rentabilité par métier"
+        subtitle="Profit net via l’Hôtel des Ventes · commodités EU · commission 5 %"
+        className="md:col-span-12"
+        actions={
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* Statut + sync des prix AH */}
+            <div className="flex flex-col items-end gap-0.5 mr-2">
+              <span className="text-[10px] text-muted-foreground">
+                {ahStatus
+                  ? `Prix AH : ${ahStatus.items_count?.toLocaleString()} items (EU ${ahStatus.commodity_items?.toLocaleString()} + realm ${ahStatus.realm_items?.toLocaleString()})${ahStatus.last_sync_at ? ` · ${new Date(ahStatus.last_sync_at + "Z").toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}` : ""}`
+                  : "Prix AH non syncés"}
+              </span>
+              {ahSyncMsg && (
+                <span className={`text-[10px] ${ahSyncMsg.startsWith("✓") ? "text-green-400" : "text-destructive"}`}>
+                  {ahSyncMsg}
+                </span>
+              )}
+            </div>
+            <Button
+              variant="frame"
+              className="px-3 py-2 text-[10px] leading-none"
+              onClick={handleSyncAHPrices}
+              disabled={ahSyncing}
+              title="Télécharge les prix commodités EU + enchères Archimonde depuis Blizzard"
+            >
+              {ahSyncing ? "Sync AH…" : "Sync AH"}
+            </Button>
+            <div className="w-px h-4 bg-border/40" />
+            {/* Sélecteur nombre de tiers / extensions */}
+            <div className="flex items-center gap-0.5">
+              {[{v:1,label:"Midnight"},{v:2,label:"Midnight + TWW"},{v:0,label:"Tous"}].map(({v,label}) => (
+                <button
+                  key={v}
+                  onClick={() => setNumTiers(v)}
+                  className={`px-2 py-1 text-[10px] rounded border transition-colors ${
+                    numTiers === v
+                      ? "border-primary bg-primary/20 text-primary"
+                      : "border-border/40 text-muted-foreground hover:text-foreground"
+                  }`}
+                  title={v===1?"Extension actuelle (Midnight)": v===2?"Midnight + The War Within":"Toutes les extensions"}
+                >{label}</button>
+              ))}
+            </div>
+            <div className="w-px h-4 bg-border/40" />
+            {/* Sélecteur profession + boutons */}
+            <select
+              className="rounded-md border border-border/60 bg-card/80 px-2 py-1 text-xs text-foreground focus:outline-none focus:border-primary/60"
+              value={profitProfession}
+              onChange={(e) => {
+                setProfitProfession(e.target.value);
+                setProfitRows(null);
+                setProfitMeta(null);
+                setProfitError(null);
+                setProfitFilterCats(new Set());
+                setProfitFilterTiers(new Set());
+                if (e.target.value) handleLoadCached(e.target.value);
+              }}
+            >
+              <option value="">— Métier —</option>
+              {byProfession.map((r) => (
+                <option key={r.profession} value={r.profession}>{r.profession}</option>
+              ))}
+            </select>
+            <Button
+              variant="frame"
+              className={actionClass}
+              onClick={handleAnalyze}
+              disabled={!profitProfession || profitLoading}
+              title="Recalcule en utilisant les réactifs Wowhead (crafting_recipe_cache) et les prix AH syncés"
+            >
+              {profitLoading ? "Scraping Wowhead + calcul…" : "(Re)calculer"}
+            </Button>
+          </div>
+        }
       >
-        <table className="dense-table">
-          <thead><tr><th>Objet</th><th>Metier</th><th>Marge estimée</th><th>Temps</th></tr></thead>
-          <tbody>
-            {filteredBestCrafts.map((craft) => (
-              <tr key={craft.item}>
-                <td className="text-foreground">{craft.item}</td>
-                <td>{craft.profession}</td>
-                <td className="text-primary">{craft.profit}</td>
-                <td>{craft.time}</td>
-              </tr>
-            ))}
-            {filteredBestCrafts.length === 0 && (
-              <tr><td colSpan={4} className="text-center text-muted-foreground italic text-xs py-2">Aucune donnée pour cette sélection.</td></tr>
+        {profitError && (
+          <p className="text-xs text-destructive py-2">{profitError}</p>
+        )}
+        {profitLoading && (
+          <div className="space-y-2">
+            <p className="text-[11px] text-muted-foreground italic">
+              Scraping Wowhead pour les recettes manquantes, puis calcul… (peut prendre 30-60 s la première fois)
+            </p>
+            {[1,2,3,4,5].map((i) => <Skeleton key={i} className="h-7 w-full" />)}
+          </div>
+        )}
+        {!profitLoading && profitMeta && (
+          <div className="flex gap-4 mb-3 text-[11px] text-muted-foreground">
+            <span>Recettes : <b className="text-foreground">{profitMeta.recipes_total ?? "—"}</b></span>
+            <span>En cache (Wowhead) : <b className="text-foreground">{profitMeta.recipes_cached ?? profitMeta.rows_count ?? "—"}</b></span>
+            {profitMeta.recipes_scraped > 0 && (
+              <span className="text-amber-400/80">Scrapé : <b>{profitMeta.recipes_scraped}</b></span>
             )}
-          </tbody>
-        </table>
+            {profitMeta.recipes_refreshed > 0 && (
+              <span className="text-sky-400/80">Rafraîchi : <b>{profitMeta.recipes_refreshed}</b></span>
+            )}
+            <span>Avec prix complets : <b className="text-foreground">{profitMeta.recipes_with_prices ?? "—"}</b></span>
+            {profitMeta.ah_prices_age_h != null && (
+              <span>Prix AH âgés de : <b className={profitMeta.ah_prices_age_h > 2 ? "text-amber-400" : "text-foreground"}>{profitMeta.ah_prices_age_h}h</b></span>
+            )}
+            {profitMeta.computed_at && (
+              <span className="ml-auto">
+                Calculé le {new Date(profitMeta.computed_at).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" })}
+              </span>
+            )}
+          </div>
+        )}
+        {!profitLoading && profitRows === null && !profitError && (
+          <p className="text-xs text-muted-foreground italic py-2">
+            {!ahStatus?.items_count
+              ? "Aucun prix AH en base — cliquer sur « Sync AH », puis sélectionner un métier."
+              : profitProfession
+              ? "Chargement du cache…"
+              : "Sélectionner un métier pour afficher l’analyse de rentabilité."}
+          </p>
+        )}
+        {!profitLoading && profitRows !== null && profitRows.length === 0 && (
+          <p className="text-xs text-muted-foreground italic py-2">
+            Pas de résultats — les recettes de ce métier ne sont peut-être pas encore dans le cache Wowhead.
+            Ouvrez les détails de recettes dans l’onglet crafting, puis relâncez l’analyse.
+          </p>
+        )}
+        {!profitLoading && profitRows?.length > 0 && (
+          <div className="overflow-x-auto">
+            {/* ── Filtres catégorie + extension ───────────────────────────── */}
+            {(availableCats.length > 1 || availableTiers.length > 1) && (
+              <div className="flex flex-wrap gap-x-4 gap-y-2 mb-3 pb-2 border-b border-border/30">
+                {availableCats.length > 1 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[10px] uppercase tracking-widest text-muted-foreground/60 mr-1 shrink-0">Catégorie</span>
+                    {availableCats.map((cat) => {
+                      const active = profitFilterCats.has(cat);
+                      return (
+                        <button
+                          key={cat}
+                          onClick={() => toggleFilterCat(cat)}
+                          className={`px-2 py-0.5 rounded text-[10px] border transition-colors ${
+                            active
+                              ? "bg-primary/20 border-primary text-primary"
+                              : "border-border/40 text-muted-foreground hover:text-foreground hover:border-border"
+                          }`}
+                        >{cat}</button>
+                      );
+                    })}
+                    {profitFilterCats.size > 0 && (
+                      <button onClick={() => setProfitFilterCats(new Set())}
+                        className="text-[10px] text-muted-foreground/50 hover:text-muted-foreground ml-0.5" title="Réinitialiser">×</button>
+                    )}
+                  </div>
+                )}
+                {availableTiers.length > 1 && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className="text-[10px] uppercase tracking-widest text-muted-foreground/60 mr-1 shrink-0">Extension</span>
+                    {availableTiers.map((tier) => {
+                      const active = profitFilterTiers.has(tier);
+                      return (
+                        <button
+                          key={tier}
+                          onClick={() => toggleFilterTier(tier)}
+                          className={`px-2 py-0.5 rounded text-[10px] border transition-colors ${
+                            active
+                              ? "bg-sky-500/20 border-sky-500/60 text-sky-400"
+                              : "border-border/40 text-muted-foreground hover:text-foreground hover:border-border"
+                          }`}
+                        >{tier}</button>
+                      );
+                    })}
+                    {profitFilterTiers.size > 0 && (
+                      <button onClick={() => setProfitFilterTiers(new Set())}
+                        className="text-[10px] text-muted-foreground/50 hover:text-muted-foreground ml-0.5" title="Réinitialiser">×</button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Compteur de lignes filtrées */}
+            {(profitFilterCats.size > 0 || profitFilterTiers.size > 0) && (
+              <p className="text-[10px] text-muted-foreground mb-2">
+                {sortedProfitRows.length} recette{sortedProfitRows.length !== 1 ? "s" : ""} affichée{sortedProfitRows.length !== 1 ? "s" : ""}
+                {" "}sur {profitRows.length}
+                <button onClick={() => { setProfitFilterCats(new Set()); setProfitFilterTiers(new Set()); }}
+                  className="ml-2 underline hover:text-foreground">Réinitialiser les filtres</button>
+              </p>
+            )}
+            <table className="dense-table w-full">
+              <thead>
+                <tr>
+                  <th className="w-5"></th>
+                  {[
+                    { key: "item_name",        label: "Objet",       align: "left"  },
+                    { key: "category",         label: "Catégorie",   align: "left"  },
+                    { key: "tier_name",        label: "Extension",   align: "left"  },
+                    { key: "crafted_count",    label: "×",           align: "right" },
+                    { key: "craft_cost_copper",label: "Coût craft",  align: "right" },
+                    { key: "sell_unit_copper", label: "Prix AH (u.)",align: "right" },
+                    { key: "profit_copper",    label: "Profit net",  align: "right" },
+                    { key: "profit_margin_pct",label: "ROI",         align: "right" },
+                  ].map(({ key, label, align }) => {
+                    const active = profitSort.key === key;
+                    return (
+                      <th
+                        key={key}
+                        className={`${align === "right" ? "text-right" : ""} cursor-pointer select-none group whitespace-nowrap`}
+                        onClick={() => toggleSort(key)}
+                      >
+                        <span className={`inline-flex items-center gap-1 ${align === "right" ? "flex-row-reverse" : ""}`}>
+                          {label}
+                          <span className={`text-[9px] transition-opacity ${
+                            active ? "opacity-100 text-foreground" : "opacity-0 group-hover:opacity-40 text-muted-foreground"
+                          }`}>
+                            {active ? (profitSort.dir === "asc" ? "▲" : "▼") : "⇅"}
+                          </span>
+                        </span>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {sortedProfitRows.flatMap((row) => {
+                  const expanded = profitExpanded.has(row.recipe_id);
+                  const hasReagents = row.reagents_known && row.reagents?.length > 0;
+                  return [
+                    <tr
+                      key={row.recipe_id}
+                      className="cursor-pointer hover:bg-muted/20"
+                      onClick={() => toggleProfitExpand(row.recipe_id)}
+                    >
+                      <td className="text-muted-foreground text-[10px] text-center">{hasReagents ? (expanded ? "▼" : "►") : ""}</td>
+                      <td>
+                        {row.item_id ? (
+                          <a
+                            href={`https://www.wowhead.com/fr/item=${row.item_id}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-[13px]"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {row.item_name}
+                          </a>
+                        ) : (
+                          <span>{row.item_name}</span>
+                        )}
+                        {!row.has_complete_data && (
+                          <span className="ml-1.5 text-[10px] text-muted-foreground/60">
+                            {!row.sell_unit_copper ? "prix vente ?" : ""}
+                            {row.missing_prices?.length > 0 && ` · ${row.missing_prices.length} réactif(s) sans prix`}
+                          </span>
+                        )}
+                      </td>
+                      <td className="text-muted-foreground text-[11px]">{row.category}</td>
+                      <td className="text-[10px] text-muted-foreground/60 whitespace-nowrap">{row.tier_name}</td>
+                      <td className="text-right text-[11px] text-muted-foreground">
+                        {row.crafted_count > 1 ? `×${row.crafted_count}` : ""}
+                      </td>
+                      <td className="text-right">
+                        {row.craft_cost_copper > 0
+                          ? <>{row.craft_cost_is_partial && <span className="text-muted-foreground mr-0.5" title="Coût partiel — certains réactifs sans prix">~</span>}{formatCopper(row.craft_cost_copper)}</>
+                          : <span className="text-muted-foreground">—</span>}
+                      </td>
+                      <td className="text-right">{row.sell_unit_copper ? formatCopper(row.sell_unit_copper) : <span className="text-muted-foreground">—</span>}</td>
+                      <td className={`text-right font-semibold ${
+                        row.profit_copper > 0 ? "text-green-400" : row.profit_copper < 0 ? "text-destructive" : ""
+                      }`}>
+                        {formatCopper(row.profit_copper)}
+                      </td>
+                      <td className={`text-right text-[11px] ${
+                        row.profit_margin_pct > 0 ? "text-green-400/70" :
+                        row.profit_margin_pct < 0 ? "text-destructive/70" : "text-muted-foreground"
+                      }`}>
+                        {row.has_complete_data
+                          ? `${row.profit_margin_pct > 0 ? "+" : ""}${row.profit_margin_pct}%`
+                          : "—"}
+                      </td>
+                    </tr>,
+                    expanded && hasReagents && (
+                      <tr key={`${row.recipe_id}-reagents`} className="bg-card/40">
+                        <td></td>
+                        <td colSpan={8} className="py-2 pr-2">
+                          <table className="dense-table w-full text-[11px]">
+                            <thead>
+                              <tr>
+                                <th>Réactif (source : Wowhead)</th>
+                                <th className="text-right">Qté</th>
+                                <th className="text-right">Prix unitaire</th>
+                                <th className="text-right">Sous-total</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {row.reagents.map((r) => (
+                                <tr key={r.item_id ?? r.item_name}>
+                                  <td>
+                                    {r.item_id
+                                      ? <a href={`https://www.wowhead.com/fr/item=${r.item_id}`} target="_blank" rel="noopener noreferrer">{r.item_name}</a>
+                                      : r.item_name}
+                                  </td>
+                                  <td className="text-right">{r.quantity}</td>
+                                  <td className="text-right">
+                                    {r.unit_price_copper
+                                      ? formatCopper(r.unit_price_copper)
+                                      : <span className="text-muted-foreground">—</span>}
+                                  </td>
+                                  <td className="text-right">
+                                    {r.total_price_copper ? formatCopper(r.total_price_copper) : "—"}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </td>
+                      </tr>
+                    ),
+                  ];
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Panel>
 
     </div>

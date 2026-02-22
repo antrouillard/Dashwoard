@@ -15,7 +15,8 @@ from app.core.config import settings
 OAUTH_BASE = "https://oauth.battle.net"
 API_BASE = f"https://{settings.BLIZZARD_REGION}.api.blizzard.com"
 NAMESPACE = f"profile-{settings.BLIZZARD_REGION}"
-STATIC_NAMESPACE = f"static-{settings.BLIZZARD_REGION}"
+STATIC_NAMESPACE   = f"static-{settings.BLIZZARD_REGION}"
+DYNAMIC_NAMESPACE  = f"dynamic-{settings.BLIZZARD_REGION}"
 LOCALE = "fr_FR"
 
 # ── Mapping noms FR (tels que retournés par Blizzard) → profession ID ─────────
@@ -297,7 +298,7 @@ async def get_app_token() -> str:
 
 
 async def _get_static(path: str, extra_params: dict | None = None) -> dict | None:
-    """GET authentifié sur l'API statique Blizzard (namespace=static-eu)."""
+    """GET authentifié sur l'API statique Blizzard (namespace=static-{region})."""
     token = await get_app_token()
     params = {"namespace": STATIC_NAMESPACE, "locale": LOCALE}
     if extra_params:
@@ -315,19 +316,45 @@ async def _get_static(path: str, extra_params: dict | None = None) -> dict | Non
         return resp.json()
 
 
-async def get_profession_recipes(profession_name: str) -> list[dict]:
+async def _get_dynamic(path: str, extra_params: dict | None = None) -> dict | None:
     """
-    Retourne la liste des recettes de la dernière extension pour une profession.
-    Format : [{recipe_id, name, category}]
+    GET authentifié sur l'API dynamique Blizzard (namespace=dynamic-{region}).
+    Utilisé pour les données temps-réel : hôtel des ventes, enchères, etc.
+    """
+    token = await get_app_token()
+    params = {"namespace": DYNAMIC_NAMESPACE, "locale": LOCALE}
+    if extra_params:
+        params.update(extra_params)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{API_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def get_profession_recipes(profession_name: str, num_tiers: int = 1) -> list[dict]:
+    """
+    Retourne la liste des recettes pour une profession.
+    Format : [{recipe_id, name, category, tier_name, tier_id}]
     Résultat mis en cache mémoire 24h (les recettes ne changent qu'à chaque patch).
 
-    On prend automatiquement le tier avec le plus grand id = extension la plus récente.
+    num_tiers : nombre de tiers à inclure par ordre décroissant (le plus grand id en premier).
+      1 = extension actuelle seulement (TWW)
+      2 = TWW + Dragonflight
+      0 = tous les tiers
     """
     key = profession_name.lower().strip()
 
-    # Cache hit
-    if key in _recipe_list_cache:
-        recipes, cached_at = _recipe_list_cache[key]
+    # Cache hit (inclut num_tiers pour éviter des résultats incorrects en cache)
+    cache_key = f"{key}::{num_tiers}"
+    if cache_key in _recipe_list_cache:
+        recipes, cached_at = _recipe_list_cache[cache_key]
         if datetime.utcnow() - cached_at < _RECIPE_CACHE_TTL:
             return recipes
 
@@ -344,30 +371,34 @@ async def get_profession_recipes(profession_name: str) -> list[dict]:
     if not skill_tiers:
         return []
 
-    # Tier le plus récent = plus grand id (TWW > DF > SL ...)
-    latest_tier = max(skill_tiers, key=lambda t: t["id"])
-
-    tier_data = await _get_static(
-        f"/data/wow/profession/{profession_id}/skill-tier/{latest_tier['id']}"
-    )
-    if not tier_data:
-        return []
+    # Tri décroissant par id (TWW > DF > SL ...)
+    sorted_tiers = sorted(skill_tiers, key=lambda t: t["id"], reverse=True)
+    tiers_to_fetch = sorted_tiers if num_tiers == 0 else sorted_tiers[:num_tiers]
 
     recipes: list[dict] = []
-    for category in tier_data.get("categories", []):
-        cat_name = category.get("name", "")
-        for recipe in category.get("recipes", []):
-            name = recipe["name"]
-            if _FAKE_RECIPE_RE.search(name):
-                continue  # pseudo-recette (en-tête de section Blizzard)
-            recipes.append({
-                "recipe_id": recipe["id"],
-                "name": name,
-                "category": cat_name,
-            })
+    for tier_meta in tiers_to_fetch:
+        tier_data = await _get_static(
+            f"/data/wow/profession/{profession_id}/skill-tier/{tier_meta['id']}"
+        )
+        if not tier_data:
+            continue
+        tier_name = tier_meta.get("name", str(tier_meta["id"]))
+        for category in tier_data.get("categories", []):
+            cat_name = category.get("name", "")
+            for recipe in category.get("recipes", []):
+                name = recipe["name"]
+                if _FAKE_RECIPE_RE.search(name):
+                    continue  # pseudo-recette (en-tête de section Blizzard)
+                recipes.append({
+                    "recipe_id": recipe["id"],
+                    "name": name,
+                    "category": cat_name,
+                    "tier_name": tier_name,
+                    "tier_id": tier_meta["id"],
+                })
 
-    recipes.sort(key=lambda r: r["name"])
-    _recipe_list_cache[key] = (recipes, datetime.utcnow())
+    recipes.sort(key=lambda r: (-r["tier_id"], r["name"]))
+    _recipe_list_cache[cache_key] = (recipes, datetime.utcnow())
     return recipes
 
 
@@ -407,6 +438,158 @@ async def get_recipe_detail(recipe_id: int) -> dict | None:
         result["item_id"] = crafted.get("item", {}).get("id")
         result["item_name"] = crafted.get("item", {}).get("name") or data.get("name")
 
-    # Les réactifs sont récupérés via Wowhead (scrape) dans la route — pas ici.
+    # Les réactifs Wowhead sont récupérés dans la route — pas ici.
     _recipe_detail_cache[recipe_id] = result
+    return result
+
+
+# ── Hôtel des Ventes ────────────────────────────────────────────────────────────────
+
+
+async def get_connected_realm_id(realm: str) -> int:
+    """
+    Résout le slug d'un royaume en ID de connected-realm Blizzard.
+    Ex : 'archimonde' → 609
+    Utilise GET /data/wow/realm/{slug}?namespace=dynamic-{region}
+    """
+    slug = realm_slug(realm)
+    token = await get_app_token()
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{API_BASE}/data/wow/realm/{slug}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"namespace": DYNAMIC_NAMESPACE, "locale": LOCALE},
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    cr_href: str = data["connected_realm"]["href"]
+    # href = "https://eu.api.blizzard.com/data/wow/connected-realm/609?..."
+    m = re.search(r"/connected-realm/(\d+)", cr_href)
+    if not m:
+        raise ValueError(f"Impossible de parser le connected-realm ID depuis : {cr_href}")
+    return int(m.group(1))
+
+
+async def fetch_realm_auctions_from_api(realm: str | None = None) -> dict:
+    """
+    Récupère les enchères non-commodity (équipement, etc.) d'un connected realm.
+    Utilise GET /data/wow/connected-realm/{id}/auctions.
+    Prix = buyout ÷ quantity  (buyout = 0 → enchere sur offre, ignorée).
+    Retourne le même format que fetch_commodities_from_api() +
+      "realm" et "connected_realm_id".
+    """
+    if realm is None:
+        realm = settings.BLIZZARD_REALM
+
+    result: dict = {
+        "ok": False,
+        "http_status": None,
+        "error": None,
+        "total_auctions": 0,
+        "sample_auctions": [],
+        "prices": {},
+        "realm": realm,
+        "connected_realm_id": None,
+    }
+
+    try:
+        cr_id = await get_connected_realm_id(realm)
+        result["connected_realm_id"] = cr_id
+
+        token = await get_app_token()
+        # Les enchères de realm peuvent peser 40-80 Mo — timeout généreux
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(
+                f"{API_BASE}/data/wow/connected-realm/{cr_id}/auctions",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"namespace": DYNAMIC_NAMESPACE},
+            )
+        result["http_status"] = resp.status_code
+        if not resp.is_success:
+            result["error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            return result
+
+        data = resp.json()
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+    auctions = data.get("auctions", [])
+    result["total_auctions"] = len(auctions)
+    result["sample_auctions"] = auctions[:3]
+
+    prices: dict[int, int] = {}
+    for auction in auctions:
+        item_id  = auction.get("item", {}).get("id")
+        buyout   = auction.get("buyout", 0)  # 0 = offre pure, pas de prix direct
+        quantity = auction.get("quantity", 1) or 1
+        if not item_id or buyout <= 0:
+            continue
+        unit_price = buyout // quantity
+        if unit_price > 0:
+            if item_id not in prices or unit_price < prices[item_id]:
+                prices[item_id] = unit_price
+
+    result["ok"]     = True
+    result["prices"] = prices
+    return result
+
+
+async def fetch_commodities_from_api() -> dict:
+    """
+    Appelle directement l'endpoint Blizzard GET /data/wow/auctions/commodities.
+    Retourne un dict de debug + les prix parsés :
+    {
+        "ok": bool,
+        "http_status": int,
+        "error": str | None,
+        "total_auctions": int,
+        "sample_auctions": list,     # 3 premières entrées brutes
+        "prices": {item_id: min_unit_price_copper},
+    }
+    Utilisé à la fois par la route de sync et la route de debug.
+    """
+    result: dict = {
+        "ok": False,
+        "http_status": None,
+        "error": None,
+        "total_auctions": 0,
+        "sample_auctions": [],
+        "prices": {},
+    }
+
+    try:
+        token = await get_app_token()
+        params = {"namespace": DYNAMIC_NAMESPACE}  # pas de locale pour les commodités
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(
+                f"{API_BASE}/data/wow/auctions/commodities",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+        result["http_status"] = resp.status_code
+        if not resp.is_success:
+            result["error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            return result
+
+        data = resp.json()
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+    auctions = data.get("auctions", [])
+    result["total_auctions"] = len(auctions)
+    result["sample_auctions"] = auctions[:3]  # apercu de la structure réelle
+
+    # Calcul du prix minimum par item
+    prices: dict[int, int] = {}
+    for auction in auctions:
+        item_id    = auction.get("item", {}).get("id")
+        unit_price = auction.get("unit_price")   # commodity → prix par unité
+        if item_id and unit_price and unit_price > 0:
+            if item_id not in prices or unit_price < prices[item_id]:
+                prices[item_id] = unit_price
+
+    result["ok"]     = True
+    result["prices"] = prices
     return result

@@ -1,5 +1,6 @@
 """Routes Crafting — commandes et objectifs de craft par personnage."""
 
+import asyncio
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
 from app.models.character import Character
-from app.models.crafting import CraftingGoal, CraftingGoalReagent, CraftingOrder, CraftingRecipeCache
+from app.models.crafting import AHPrice, CraftingGoal, CraftingGoalReagent, CraftingOrder, CraftingRecipeCache, ProfitabilityResult
 from app.schemas.crafting import (
     CraftingGoalCreate,
     CraftingGoalOut,
@@ -414,6 +415,530 @@ async def search_item(q: str):
     if not result:
         raise HTTPException(status_code=404, detail=f"Item '{q}' non trouvé sur Wowhead")
     return result
+
+
+# ── Hôtel des Ventes — Sync prix + debug ──────────────────────────────────────────
+
+@router.post("/ah-prices/sync")
+async def sync_ah_prices(db: Session = Depends(get_db)):
+    """
+    Récupère les prix de l'Hôtel des Ventes depuis deux sources Blizzard :
+    - Commodités EU-wide  (GET /auctions/commodities)
+    - Enchères realm-specific Archimonde (GET /connected-realm/{id}/auctions)
+    Fusionne les résultats dans `ah_prices` (prix le plus bas gagne).
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt
+
+    # Lancement parallèle des deux fetch
+    commodity_fetch, realm_fetch = await _asyncio.gather(
+        bz.fetch_commodities_from_api(),
+        bz.fetch_realm_auctions_from_api(),
+        return_exceptions=True,
+    )
+
+    errors = []
+    merged: dict[int, tuple[int, str]] = {}   # item_id → (min_price, source)
+
+    # ─ Commodités ──────────────────────────────────────────────────────────
+    if isinstance(commodity_fetch, Exception):
+        errors.append(f"commodities exception: {commodity_fetch}")
+    elif not commodity_fetch["ok"]:
+        errors.append(f"commodities HTTP {commodity_fetch.get('http_status')}: {commodity_fetch.get('error')}")
+    else:
+        for iid, price in commodity_fetch["prices"].items():
+            if iid not in merged or price < merged[iid][0]:
+                merged[iid] = (price, "commodity")
+
+    # ─ Realm auctions ──────────────────────────────────────────────────────
+    realm_cr_id = None
+    if isinstance(realm_fetch, Exception):
+        errors.append(f"realm exception: {realm_fetch}")
+    elif not realm_fetch["ok"]:
+        errors.append(f"realm HTTP {realm_fetch.get('http_status')}: {realm_fetch.get('error')}")
+    else:
+        realm_cr_id = realm_fetch.get("connected_realm_id")
+        for iid, price in realm_fetch["prices"].items():
+            if iid not in merged or price < merged[iid][0]:
+                merged[iid] = (price, "realm")
+
+    if not merged:
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "Aucun prix récupéré", "errors": errors},
+        )
+
+    # ─ Bulk upsert ─────────────────────────────────────────────────────────
+    now = _dt.utcnow()
+    for item_id, (min_price, source) in merged.items():
+        row = db.get(AHPrice, item_id)
+        if row:
+            row.min_price_copper = min_price
+            row.source           = source
+            row.fetched_at       = now
+        else:
+            db.add(AHPrice(item_id=item_id, min_price_copper=min_price, source=source, fetched_at=now))
+    db.commit()
+
+    commodity_count = sum(1 for _, s in merged.values() if s == "commodity")
+    realm_count     = sum(1 for _, s in merged.values() if s == "realm")
+
+    return {
+        "ok":              True,
+        "items_upserted":  len(merged),
+        "commodity_items": commodity_count,
+        "realm_items":     realm_count,
+        "realm":           realm_fetch.get("realm") if not isinstance(realm_fetch, Exception) else None,
+        "connected_realm_id": realm_cr_id,
+        "fetched_at":      now.isoformat(),
+        "warnings":        errors if errors else None,
+    }
+
+
+@router.get("/ah-prices/status")
+def get_ah_prices_status(db: Session = Depends(get_db)):
+    """
+    Retourne le nombre de prix stockés en base (total + par source) et l'horodatage du dernier sync.
+    """
+    from sqlalchemy import func as sqlfunc
+    row = db.query(
+        sqlfunc.count(AHPrice.item_id).label("count"),
+        sqlfunc.max(AHPrice.fetched_at).label("last_sync"),
+    ).one()
+    commodity_count = db.query(sqlfunc.count(AHPrice.item_id)).filter(AHPrice.source == "commodity").scalar()
+    realm_count     = db.query(sqlfunc.count(AHPrice.item_id)).filter(AHPrice.source == "realm").scalar()
+    return {
+        "items_count":      row.count,
+        "commodity_items":  commodity_count,
+        "realm_items":      realm_count,
+        "last_sync_at":     row.last_sync.isoformat() if row.last_sync else None,
+    }
+
+
+@router.get("/ah-prices/items")
+def get_ah_prices_for_items(ids: str = "", db: Session = Depends(get_db)):
+    """
+    Retourne les prix AH stockés en base pour une liste d'item_id.
+    Paramètre : ids=1234,5678,9012  (ids séparés par virgule)
+    Réponse   : { item_id: min_price_copper, ... }
+    Utilisé par le frontend pour afficher les prix dans les cartes commandes/objectifs/matières.
+    """
+    if not ids.strip():
+        return {}
+    try:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip()]
+    except ValueError:
+        return {}
+    if not id_list:
+        return {}
+    rows = db.query(AHPrice).filter(AHPrice.item_id.in_(id_list)).all()
+    return {row.item_id: row.min_price_copper for row in rows}
+
+
+@router.get("/debug/ah-price/{item_id}")
+async def debug_ah_price(item_id: int, db: Session = Depends(get_db)):
+    """
+    Route de diagnostic pour un item_id donné :
+    - Retourne le prix stocké en base (ah_prices) avec sa source
+    - Vérifie dans l'API commodités EU (items stackables)
+    - Vérifie dans l'API realm AH Archimonde (équipements)
+    - Montre les 3 premières enchères brutes de chaque source
+    La DB peut avoir un prix "realm" même si l'item est absent des commodités — c'est normal.
+    """
+    # ─ Prix en base ──────────────────────────────────────────────────────────
+    db_row = db.get(AHPrice, item_id)
+    db_info = (
+        {
+            "min_price_copper": db_row.min_price_copper,
+            "source":           db_row.source,
+            "fetched_at":       db_row.fetched_at.isoformat(),
+        }
+        if db_row
+        else None
+    )
+
+    # ─ Vérification dans les commodités EU (items stackables, namespace dynamic-eu) ──
+    commodity_fetch = await bz.fetch_commodities_from_api()
+    commodity_result = None
+    if commodity_fetch["ok"]:
+        price = commodity_fetch["prices"].get(item_id)
+        commodity_result = {
+            "found_in_api":      price is not None,
+            "min_price_copper":  price,
+            "note":              "Items stackables EU (consommables, matériaux). Absent = normal pour l'équipement.",
+        }
+
+    # ─ Vérification dans le realm AH Archimonde (équipements, enchères spécifiques) ──
+    realm_fetch = await bz.fetch_realm_auctions_from_api()
+    realm_result = None
+    if realm_fetch["ok"]:
+        price = realm_fetch["prices"].get(item_id)
+        realm_result = {
+            "found_in_api":      price is not None,
+            "min_price_copper":  price,
+            "realm":             realm_fetch.get("realm"),
+            "note":              "Enchères realm-specific (équipement, BoE). Absent = item non listé en ce moment.",
+        }
+
+    return {
+        "item_id":    item_id,
+        "db_price":   db_info,
+        "explanation": (
+            f"Prix en DB provient de '{db_info['source']}'. "
+            + ("L'API commodity ne couvre que les items stackables (consommables, matériaux) — "
+               "l'absence ici est normale pour l'équipement." if db_info and db_info["source"] == "realm"
+               else "")
+        ) if db_info else "Aucun prix en DB pour cet item.",
+        "commodity_api": {
+            "ok":            commodity_fetch["ok"],
+            "http_status":   commodity_fetch["http_status"],
+            "error":         commodity_fetch["error"],
+            "total_auctions": commodity_fetch["total_auctions"],
+            "sample_auctions": commodity_fetch["sample_auctions"],
+            "item_result":   commodity_result,
+        },
+        "realm_api": {
+            "ok":            realm_fetch.get("ok"),
+            "http_status":   realm_fetch.get("http_status"),
+            "error":         realm_fetch.get("error"),
+            "total_auctions": realm_fetch.get("total_auctions"),
+            "sample_auctions": realm_fetch.get("sample_auctions"),
+            "item_result":   realm_result,
+        },
+    }
+
+
+# ── Analyse de rentabilité (DB-backed) ────────────────────────────────────────────
+
+def _compute_profitability(
+    profession_lower: str,
+    recipes: list[dict],
+    cache_rows: dict,      # {recipe_id: CraftingRecipeCache}
+    ah_prices: dict,       # {item_id: min_price_copper}
+    ah_age_h: float | None,
+) -> dict:
+    """
+    Calcule la rentabilité pour toutes les recettes d'une profession.
+    Source des réactifs : table `crafting_recipe_cache` (Wowhead).
+    Source des prix      : table `ah_prices` (commodités EU).
+    Retourne le dict à stocker dans ProfitabilityResult.
+    """
+    AH_CUT = 0.05
+    rows = []
+    recipes_with_prices = 0
+
+    for recipe in recipes:
+        rid = recipe["recipe_id"]
+        cached = cache_rows.get(rid)   # peut être None si pas encore en DB
+
+        if cached:
+            wowhead_reagents: list[dict] = json.loads(cached.reagents_json) if cached.reagents_json else []
+            item_id   = cached.item_id
+            item_name = cached.item_name or recipe["name"]
+            recipe_name = cached.recipe_name or recipe["name"]
+        else:
+            wowhead_reagents = []
+            item_id          = None
+            item_name        = recipe["name"]
+            recipe_name      = recipe["name"]
+
+        crafted_count = 1
+
+        # ─ Coût de fabrication ──────────────────────────────────────────
+        craft_cost      = 0
+        missing_prices: list[str] = []
+        reagent_rows    = []
+
+        for r in wowhead_reagents:
+            r_item_id = r.get("item_id")
+            r_qty     = r.get("quantity", 1)
+            r_name    = r.get("item_name") or f"item#{r_item_id}"
+            r_unit    = ah_prices.get(r_item_id, 0) if r_item_id else 0
+            r_total   = r_unit * r_qty
+
+            reagent_rows.append({
+                "item_id":            r_item_id,
+                "item_name":          r_name,
+                "quantity":           r_qty,
+                "unit_price_copper":  r_unit,
+                "total_price_copper": r_total,
+            })
+
+            if r_unit > 0:
+                craft_cost += r_total
+            else:
+                missing_prices.append(r_name)
+
+        # ─ Prix de vente et profit ────────────────────────────────────
+        sell_unit  = ah_prices.get(item_id, 0) if item_id else 0
+        sell_total = sell_unit * crafted_count
+        sell_net   = int(sell_total * (1 - AH_CUT))
+        profit     = sell_net - craft_cost
+        margin     = round(profit / craft_cost * 100, 1) if craft_cost > 0 else 0
+
+        has_complete = (
+            len(missing_prices) == 0
+            and sell_unit > 0
+            and craft_cost > 0
+        )
+        if has_complete:
+            recipes_with_prices += 1
+
+        rows.append({
+            "recipe_id":              rid,
+            "recipe_name":            recipe_name,
+            "category":               recipe.get("category", ""),
+            "tier_name":              recipe.get("tier_name", ""),
+            "item_id":                item_id,
+            "item_name":              item_name,
+            "crafted_count":          crafted_count,
+            "reagents":               reagent_rows,
+            "craft_cost_copper":      craft_cost,
+            "craft_cost_is_partial":  len(missing_prices) > 0,
+            "sell_unit_copper":       sell_unit,
+            "sell_total_copper":      sell_total,
+            "profit_copper":          profit,
+            "profit_margin_pct":      margin,
+            "missing_prices":         missing_prices,
+            "has_complete_data":      has_complete,
+            "reagents_known":         len(wowhead_reagents) > 0,
+        })
+
+    # Tri : 1) données complètes (meilleur profit d'abord)
+    #        2) coût partiel connu (craft_cost > 0)
+    #        3) aucun prix connu
+    def _sort_key(r):
+        if r["has_complete_data"]:
+            return (0, -r["profit_copper"])
+        elif r["craft_cost_copper"] > 0:
+            return (1, -r["craft_cost_copper"])
+        else:
+            return (2, 0)
+
+    rows.sort(key=_sort_key)
+    return {
+        "rows": rows,
+        "recipes_total":       len(recipes),
+        "recipes_cached":      len(cache_rows),
+        "recipes_with_prices": recipes_with_prices,
+        "ah_prices_age_h":     ah_age_h,
+    }
+
+
+async def _ensure_recipe_cached(
+    recipe_id: int,
+    recipe_name: str,
+    sem: asyncio.Semaphore,
+) -> dict | None:
+    """
+    Télécharge les détails + réactifs pour une recette.
+    Retourne toujours un dict (même si vide) pour permettre la persistance
+    et éviter de re-scraper indéfiniment.
+    Retourne None uniquement sur exception grave.
+    """
+    async with sem:
+        try:
+            detail = await bz.get_recipe_detail(recipe_id)
+
+            # Si Blizzard ne donne pas item_id, fallback sur Wowhead search par nom
+            if not detail or not detail.get("item_id"):
+                # Certaines recettes ont un préfixe : "Recette : ", "Patron : ", etc.
+                search_name = recipe_name
+                for prefix in ["Recette : ", "Recipe: ", "Patron : ", "Plans : ", "Schéma : ",
+                                "Formule : ", "Technique : ", "Gravure : "]:
+                    if search_name.startswith(prefix):
+                        search_name = search_name[len(prefix):]
+                        break
+                wh_result = await wh.search_item(search_name)
+                if wh_result:
+                    if detail:
+                        detail["item_id"]   = wh_result["item_id"]
+                        detail["item_name"] = wh_result.get("item_name") or recipe_name
+                    else:
+                        detail = {
+                            "recipe_id":   recipe_id,
+                            "recipe_name": recipe_name,
+                            "item_id":     wh_result["item_id"],
+                            "item_name":   wh_result.get("item_name") or recipe_name,
+                        }
+
+            item_id = detail.get("item_id") if detail else None
+            reagents: list[dict] = []
+            if item_id:
+                reagents = await wh.get_reagents_by_item(item_id)
+
+            return {
+                "recipe_id":   recipe_id,
+                "item_id":     item_id,
+                "item_name":   (detail.get("item_name") if detail else None) or recipe_name,
+                "recipe_name": (detail.get("recipe_name") if detail else None) or recipe_name,
+                "reagents":    reagents,
+            }
+        except Exception:
+            return None
+
+
+@router.post("/profitability/analyze")
+async def analyze_profitability(profession: str, num_tiers: int = 1, db: Session = Depends(get_db)):
+    """
+    Lance le calcul de rentabilité pour un métier.
+    1. Récupère la liste des recettes Blizzard pour chaque tier demandé.
+    2. Pour toute recette absente du cache DB, scrape Wowhead en parallèle
+       (semaphore = 5 requêtes simultanées max) et persiste en DB.
+    3. Calcule la rentabilité via `crafting_recipe_cache` + `ah_prices`.
+    4. Stocke le résultat dans `profitability_results`.
+
+    num_tiers : 1=TWW seul, 2=TWW+DF, 0=toutes extensions.
+    """
+    from datetime import datetime
+    from sqlalchemy import func as sqlfunc
+
+    profession_lower = profession.lower().strip()
+    recipes = await bz.get_profession_recipes(profession_lower, num_tiers=num_tiers)
+    if not recipes:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Profession '{profession}' introuvable ou sans recettes.",
+        )
+
+    recipe_ids = [r["recipe_id"] for r in recipes]
+
+    # ─ Étape 1 : recettes déjà en cache DB (toutes les entrées existantes) ─────────
+    existing = (
+        db.query(CraftingRecipeCache)
+        .filter(CraftingRecipeCache.recipe_id.in_(recipe_ids))
+        .all()
+    )
+
+    def _needs_rescrape(row) -> bool:
+        """Retourne True si l'entrée doit être re-scrapée."""
+        # Pas d'item_id → premier scrape a échoué (ex: Blizzard ne donne pas item_id)
+        if not row.item_id:
+            return True
+        # Réactifs vides → Wowhead n'a pas trouvé la section created-by-spell
+        reagents = json.loads(row.reagents_json) if row.reagents_json else []
+        if not reagents:
+            return True
+        # Noms manquants dans les réactifs → résolution XML avait échoué
+        if any(not r.get("item_name") for r in reagents):
+            return True
+        return False
+
+    # Recettes complètement absentes de la DB
+    existing_map = {e.recipe_id: e for e in existing}
+    cached_ids = set(existing_map.keys())
+    missing = [r for r in recipes if r["recipe_id"] not in cached_ids]
+    # Recettes présentes en DB mais incomplètes (item_id null, réactifs vides, noms null)
+    stale = [r for r in recipes if r["recipe_id"] in cached_ids
+             and _needs_rescrape(existing_map[r["recipe_id"]])]
+    missing = missing + stale
+
+    # ─ Étape 2 : scrape Wowhead en parallèle pour les recettes manquantes/obsolètes ────
+    recipes_scraped = 0
+    recipes_refreshed = len(stale)
+    if missing:
+        sem = asyncio.Semaphore(10)  # max 10 requêtes Wowhead simultanées
+        tasks = [_ensure_recipe_cached(r["recipe_id"], r["name"], sem) for r in missing]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result_item in results:
+            if not isinstance(result_item, dict):
+                continue
+            rid = result_item["recipe_id"]
+            row = db.get(CraftingRecipeCache, rid)
+            if row is None:
+                row = CraftingRecipeCache(recipe_id=rid)
+                db.add(row)
+            row.item_id       = result_item["item_id"]
+            row.item_name     = result_item["item_name"]
+            row.recipe_name   = result_item["recipe_name"]
+            row.reagents_json = json.dumps(result_item["reagents"], ensure_ascii=False)
+            recipes_scraped  += 1
+        if recipes_scraped:
+            db.commit()
+
+    # ─ Étape 3 : cache complet rechargé (tous les recipe_id, même sans réactifs) ───
+    cache_rows_list = (
+        db.query(CraftingRecipeCache)
+        .filter(CraftingRecipeCache.recipe_id.in_(recipe_ids))
+        .all()
+    )
+    cache_rows = {c.recipe_id: c for c in cache_rows_list}
+
+    # ─ Étape 4 : prix AH ─────────────────────────────────────────────────────
+    ah_price_rows = db.query(AHPrice).all()
+    ah_prices = {row.item_id: row.min_price_copper for row in ah_price_rows}
+    last_sync = db.query(sqlfunc.max(AHPrice.fetched_at)).scalar()
+    ah_age_h: float | None = None
+    if last_sync:
+        ah_age_h = round((datetime.utcnow() - last_sync).total_seconds() / 3600, 2)
+
+    # ─ Étape 5 : calcul ──────────────────────────────────────────────────────
+    result = _compute_profitability(
+        profession_lower, recipes, cache_rows, ah_prices, ah_age_h
+    )
+
+    # ─ Étape 6 : persistance ─────────────────────────────────────────────────
+    prow = db.get(ProfitabilityResult, profession_lower)
+    now  = datetime.utcnow()
+    if prow:
+        prow.results_json        = json.dumps(result["rows"], ensure_ascii=False)
+        prow.computed_at         = now
+        prow.recipes_total       = result["recipes_total"]
+        prow.recipes_with_prices = result["recipes_with_prices"]
+        prow.ah_prices_age_h     = result["ah_prices_age_h"]
+    else:
+        prow = ProfitabilityResult(
+            profession           = profession_lower,
+            results_json         = json.dumps(result["rows"], ensure_ascii=False),
+            recipes_total        = result["recipes_total"],
+            recipes_with_prices  = result["recipes_with_prices"],
+            ah_prices_age_h      = result["ah_prices_age_h"],
+        )
+        db.add(prow)
+    db.commit()
+
+    return {
+        "ok":                    True,
+        "profession":            profession_lower,
+        "recipes_total":         result["recipes_total"],
+        "recipes_cached":        result["recipes_cached"],
+        "recipes_scraped":       recipes_scraped,
+        "recipes_refreshed":     recipes_refreshed,
+        "recipes_with_prices":   result["recipes_with_prices"],
+        "ah_prices_count":       len(ah_prices),
+        "ah_prices_age_h":       ah_age_h,
+        "rows_count":            len(result["rows"]),
+        "computed_at":           prow.computed_at.isoformat(),
+    }
+
+
+@router.get("/profitability")
+def get_crafting_profitability(profession: str, db: Session = Depends(get_db)):
+    """
+    Retourne les résultats d'analyse de rentabilité mis en cache en base.
+    Lancer POST /profitability/analyze pour forcer un recalcul.
+    """
+    profession_lower = profession.lower().strip()
+    prow = db.get(ProfitabilityResult, profession_lower)
+    if not prow:
+        return {
+            "rows": [],
+            "meta": {
+                "cached": False,
+                "message": "Aucune analyse en base — lancer POST /profitability/analyze d'abord.",
+            },
+        }
+
+    return {
+        "rows":       json.loads(prow.results_json),
+        "meta": {
+            "cached":             True,
+            "computed_at":        prow.computed_at.isoformat(),
+            "recipes_total":      prow.recipes_total,
+            "recipes_with_prices": prow.recipes_with_prices,
+            "ah_prices_age_h":    prow.ah_prices_age_h,
+        },
+    }
 
 
 # ── Admin / Debug ─────────────────────────────────────────────────────────────

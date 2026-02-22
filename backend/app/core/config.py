@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     BLIZZARD_CLIENT_SECRET: str = ""
     BLIZZARD_REDIRECT_URI: str = "http://localhost:8000/auth/callback"
     BLIZZARD_REGION: str = "eu"
+    BLIZZARD_REALM: str = "archimonde"
 
     # CORS – accepte soit un JSON array soit une string séparée par des virgules
     ALLOWED_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:4173"]

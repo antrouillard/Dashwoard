@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -76,3 +77,36 @@ class CraftingRecipeCache(Base):
     recipe_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
     reagents_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     cached_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class AHPrice(Base):
+    """
+    Prix minimum de l'Hôtel des Ventes (commodités EU-wide) par item.
+    Mis à jour en bloc via POST /crafting/ah-prices/sync.
+    """
+    __tablename__ = "ah_prices"
+
+    item_id: Mapped[int] = mapped_column(primary_key=True)
+    min_price_copper: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="commodity")
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ProfitabilityResult(Base):
+    """
+    Cache des résultats d'analyse de rentabilité de craft par profession.
+    Calculé une seule fois ou sur demande via POST /crafting/profitability/analyze.
+    """
+    __tablename__ = "profitability_results"
+
+    profession: Mapped[str] = mapped_column(String(100), primary_key=True)
+    results_json: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False, default="[]")
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    recipes_total: Mapped[int] = mapped_column(Integer, default=0)
+    recipes_with_prices: Mapped[int] = mapped_column(Integer, default=0)
+    # Âge (en heures) des prix AH utilisés lors du calcul
+    ah_prices_age_h: Mapped[float | None] = mapped_column(Float, nullable=True)
