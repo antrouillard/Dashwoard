@@ -24,7 +24,7 @@ class CraftingOrder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
-    character: Mapped["Character"] = relationship("Character")  # noqa: F821
+    character: Mapped["Character"] = relationship("Character", back_populates="crafting_orders")  # noqa: F821
 
 
 class CraftingGoal(Base):
@@ -43,7 +43,7 @@ class CraftingGoal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
-    character: Mapped["Character"] = relationship("Character")  # noqa: F821
+    character: Mapped["Character"] = relationship("Character", back_populates="crafting_goals")  # noqa: F821
     reagent_quantities: Mapped[list["CraftingGoalReagent"]] = relationship(
         "CraftingGoalReagent", back_populates="goal", cascade="all, delete-orphan"
     )
@@ -88,6 +88,7 @@ class AHPrice(Base):
 
     item_id: Mapped[int] = mapped_column(primary_key=True)
     min_price_copper: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    quantity_listed: Mapped[int | None] = mapped_column(Integer, nullable=True)  # stock AH actuel
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="commodity")
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

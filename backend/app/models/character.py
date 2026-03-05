@@ -58,3 +58,9 @@ class Character(Base):
     weekly_activities: Mapped[list["WeeklyActivity"]] = relationship(  # noqa: F821
         "WeeklyActivity", back_populates="character", cascade="all, delete-orphan"
     )
+    crafting_orders: Mapped[list["CraftingOrder"]] = relationship(  # noqa: F821
+        "CraftingOrder", back_populates="character", cascade="all, delete-orphan"
+    )
+    crafting_goals: Mapped[list["CraftingGoal"]] = relationship(  # noqa: F821
+        "CraftingGoal", back_populates="character", cascade="all, delete-orphan"
+    )

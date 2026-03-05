@@ -488,6 +488,7 @@ async def fetch_realm_auctions_from_api(realm: str | None = None) -> dict:
         "total_auctions": 0,
         "sample_auctions": [],
         "prices": {},
+        "quantities": {},
         "realm": realm,
         "connected_realm_id": None,
     }
@@ -519,6 +520,7 @@ async def fetch_realm_auctions_from_api(realm: str | None = None) -> dict:
     result["sample_auctions"] = auctions[:3]
 
     prices: dict[int, int] = {}
+    quantities: dict[int, int] = {}
     for auction in auctions:
         item_id  = auction.get("item", {}).get("id")
         buyout   = auction.get("buyout", 0)  # 0 = offre pure, pas de prix direct
@@ -529,9 +531,11 @@ async def fetch_realm_auctions_from_api(realm: str | None = None) -> dict:
         if unit_price > 0:
             if item_id not in prices or unit_price < prices[item_id]:
                 prices[item_id] = unit_price
+            quantities[item_id] = quantities.get(item_id, 0) + quantity
 
-    result["ok"]     = True
-    result["prices"] = prices
+    result["ok"]         = True
+    result["prices"]     = prices
+    result["quantities"] = quantities
     return result
 
 
@@ -556,6 +560,7 @@ async def fetch_commodities_from_api() -> dict:
         "total_auctions": 0,
         "sample_auctions": [],
         "prices": {},
+        "quantities": {},
     }
 
     try:
@@ -581,15 +586,19 @@ async def fetch_commodities_from_api() -> dict:
     result["total_auctions"] = len(auctions)
     result["sample_auctions"] = auctions[:3]  # apercu de la structure réelle
 
-    # Calcul du prix minimum par item
+    # Calcul du prix minimum et de la quantité totale listée par item
     prices: dict[int, int] = {}
+    quantities: dict[int, int] = {}
     for auction in auctions:
         item_id    = auction.get("item", {}).get("id")
         unit_price = auction.get("unit_price")   # commodity → prix par unité
+        quantity   = auction.get("quantity", 1) or 1
         if item_id and unit_price and unit_price > 0:
             if item_id not in prices or unit_price < prices[item_id]:
                 prices[item_id] = unit_price
+            quantities[item_id] = quantities.get(item_id, 0) + quantity
 
-    result["ok"]     = True
-    result["prices"] = prices
+    result["ok"]         = True
+    result["prices"]     = prices
+    result["quantities"] = quantities
     return result

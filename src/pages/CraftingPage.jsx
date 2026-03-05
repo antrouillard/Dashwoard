@@ -460,6 +460,10 @@ function CraftingPage() {
       const realmLabel = res.realm ? ` · ${res.realm} (${res.realm_items?.toLocaleString()} items)` : "";
       setAhSyncMsg(`✓ ${res.items_upserted?.toLocaleString()} items — commodités EU : ${res.commodity_items?.toLocaleString()}${realmLabel}`);
       api.crafting.ahPricesStatus().then(setAhStatus).catch(() => {});
+      // Si un métier est déjà sélectionné, relancer automatiquement l'analyse avec les prix frais
+      if (profitProfession) {
+        await handleAnalyze();
+      }
     } catch (err) {
       setAhSyncMsg(`✗ ${err.message ?? "Erreur sync"}`);
     } finally {
@@ -1185,6 +1189,7 @@ function CraftingPage() {
                     { key: "crafted_count",    label: "×",           align: "right" },
                     { key: "craft_cost_copper",label: "Coût craft",  align: "right" },
                     { key: "sell_unit_copper", label: "Prix AH (u.)",align: "right" },
+                    { key: "sell_quantity_listed", label: "Stock AH", align: "right" },
                     { key: "profit_copper",    label: "Profit net",  align: "right" },
                     { key: "profit_margin_pct",label: "ROI",         align: "right" },
                   ].map(({ key, label, align }) => {
@@ -1251,6 +1256,11 @@ function CraftingPage() {
                           : <span className="text-muted-foreground">—</span>}
                       </td>
                       <td className="text-right">{row.sell_unit_copper ? formatCopper(row.sell_unit_copper) : <span className="text-muted-foreground">—</span>}</td>
+                      <td className="text-right text-[11px] text-muted-foreground">
+                        {row.sell_quantity_listed != null
+                          ? row.sell_quantity_listed.toLocaleString("fr-FR")
+                          : <span className="opacity-40">—</span>}
+                      </td>
                       <td className={`text-right font-semibold ${
                         row.profit_copper > 0 ? "text-green-400" : row.profit_copper < 0 ? "text-destructive" : ""
                       }`}>
@@ -1268,13 +1278,14 @@ function CraftingPage() {
                     expanded && hasReagents && (
                       <tr key={`${row.recipe_id}-reagents`} className="bg-card/40">
                         <td></td>
-                        <td colSpan={8} className="py-2 pr-2">
+                        <td colSpan={9} className="py-2 pr-2">
                           <table className="dense-table w-full text-[11px]">
                             <thead>
                               <tr>
                                 <th>Réactif (source : Wowhead)</th>
                                 <th className="text-right">Qté</th>
                                 <th className="text-right">Prix unitaire</th>
+                                <th className="text-right">Stock AH</th>
                                 <th className="text-right">Sous-total</th>
                               </tr>
                             </thead>
@@ -1291,6 +1302,11 @@ function CraftingPage() {
                                     {r.unit_price_copper
                                       ? formatCopper(r.unit_price_copper)
                                       : <span className="text-muted-foreground">—</span>}
+                                  </td>
+                                  <td className="text-right text-[11px] text-muted-foreground">
+                                    {r.quantity_listed != null
+                                      ? r.quantity_listed.toLocaleString("fr-FR")
+                                      : <span className="opacity-40">—</span>}
                                   </td>
                                   <td className="text-right">
                                     {r.total_price_copper ? formatCopper(r.total_price_copper) : "—"}

@@ -439,6 +439,7 @@ async def sync_ah_prices(db: Session = Depends(get_db)):
 
     errors = []
     merged: dict[int, tuple[int, str]] = {}   # item_id → (min_price, source)
+    merged_qty: dict[int, int] = {}            # item_id → total quantity listed
 
     # ─ Commodités ──────────────────────────────────────────────────────────
     if isinstance(commodity_fetch, Exception):
@@ -449,6 +450,8 @@ async def sync_ah_prices(db: Session = Depends(get_db)):
         for iid, price in commodity_fetch["prices"].items():
             if iid not in merged or price < merged[iid][0]:
                 merged[iid] = (price, "commodity")
+        for iid, qty in commodity_fetch.get("quantities", {}).items():
+            merged_qty[iid] = merged_qty.get(iid, 0) + qty
 
     # ─ Realm auctions ──────────────────────────────────────────────────────
     realm_cr_id = None
@@ -461,6 +464,8 @@ async def sync_ah_prices(db: Session = Depends(get_db)):
         for iid, price in realm_fetch["prices"].items():
             if iid not in merged or price < merged[iid][0]:
                 merged[iid] = (price, "realm")
+        for iid, qty in realm_fetch.get("quantities", {}).items():
+            merged_qty[iid] = merged_qty.get(iid, 0) + qty
 
     if not merged:
         raise HTTPException(
@@ -472,12 +477,14 @@ async def sync_ah_prices(db: Session = Depends(get_db)):
     now = _dt.utcnow()
     for item_id, (min_price, source) in merged.items():
         row = db.get(AHPrice, item_id)
+        qty = merged_qty.get(item_id)
         if row:
             row.min_price_copper = min_price
+            row.quantity_listed  = qty
             row.source           = source
             row.fetched_at       = now
         else:
-            db.add(AHPrice(item_id=item_id, min_price_copper=min_price, source=source, fetched_at=now))
+            db.add(AHPrice(item_id=item_id, min_price_copper=min_price, quantity_listed=qty, source=source, fetched_at=now))
     db.commit()
 
     commodity_count = sum(1 for _, s in merged.values() if s == "commodity")
@@ -613,9 +620,10 @@ async def debug_ah_price(item_id: int, db: Session = Depends(get_db)):
 def _compute_profitability(
     profession_lower: str,
     recipes: list[dict],
-    cache_rows: dict,      # {recipe_id: CraftingRecipeCache}
-    ah_prices: dict,       # {item_id: min_price_copper}
+    cache_rows: dict,            # {recipe_id: CraftingRecipeCache}
+    ah_prices: dict,             # {item_id: min_price_copper}
     ah_age_h: float | None,
+    ah_quantities: dict | None = None,  # {item_id: quantity_listed}
 ) -> dict:
     """
     Calcule la rentabilité pour toutes les recettes d'une profession.
@@ -626,6 +634,7 @@ def _compute_profitability(
     AH_CUT = 0.05
     rows = []
     recipes_with_prices = 0
+    ah_qty = ah_quantities or {}
 
     for recipe in recipes:
         rid = recipe["recipe_id"]
@@ -655,6 +664,7 @@ def _compute_profitability(
             r_name    = r.get("item_name") or f"item#{r_item_id}"
             r_unit    = ah_prices.get(r_item_id, 0) if r_item_id else 0
             r_total   = r_unit * r_qty
+            r_qty_listed = ah_qty.get(r_item_id) if r_item_id else None
 
             reagent_rows.append({
                 "item_id":            r_item_id,
@@ -662,6 +672,7 @@ def _compute_profitability(
                 "quantity":           r_qty,
                 "unit_price_copper":  r_unit,
                 "total_price_copper": r_total,
+                "quantity_listed":    r_qty_listed,
             })
 
             if r_unit > 0:
@@ -675,6 +686,7 @@ def _compute_profitability(
         sell_net   = int(sell_total * (1 - AH_CUT))
         profit     = sell_net - craft_cost
         margin     = round(profit / craft_cost * 100, 1) if craft_cost > 0 else 0
+        sell_qty_listed = ah_qty.get(item_id) if item_id else None
 
         has_complete = (
             len(missing_prices) == 0
@@ -697,6 +709,7 @@ def _compute_profitability(
             "craft_cost_is_partial":  len(missing_prices) > 0,
             "sell_unit_copper":       sell_unit,
             "sell_total_copper":      sell_total,
+            "sell_quantity_listed":   sell_qty_listed,
             "profit_copper":          profit,
             "profit_margin_pct":      margin,
             "missing_prices":         missing_prices,
@@ -866,7 +879,8 @@ async def analyze_profitability(profession: str, num_tiers: int = 1, db: Session
 
     # ─ Étape 4 : prix AH ─────────────────────────────────────────────────────
     ah_price_rows = db.query(AHPrice).all()
-    ah_prices = {row.item_id: row.min_price_copper for row in ah_price_rows}
+    ah_prices     = {row.item_id: row.min_price_copper for row in ah_price_rows}
+    ah_quantities = {row.item_id: row.quantity_listed for row in ah_price_rows if row.quantity_listed is not None}
     last_sync = db.query(sqlfunc.max(AHPrice.fetched_at)).scalar()
     ah_age_h: float | None = None
     if last_sync:
@@ -874,7 +888,7 @@ async def analyze_profitability(profession: str, num_tiers: int = 1, db: Session
 
     # ─ Étape 5 : calcul ──────────────────────────────────────────────────────
     result = _compute_profitability(
-        profession_lower, recipes, cache_rows, ah_prices, ah_age_h
+        profession_lower, recipes, cache_rows, ah_prices, ah_age_h, ah_quantities
     )
 
     # ─ Étape 6 : persistance ─────────────────────────────────────────────────
